@@ -10,7 +10,7 @@ import os
 import sys
 import argparse
 import pandas as pd
-from script_parser import parse_screenplay
+from script_parser import parse_screenplay, episode_number
 from clip_extractor import extract_candidate_windows, score_and_rank_candidates, format_llm_payload
 
 
@@ -28,7 +28,7 @@ def process_all_episodes(
             if f.endswith(".txt"):
                 txt_files.append(os.path.join(root, f))
     
-    txt_files = sorted(txt_files)
+    txt_files = sorted(txt_files, key=lambda f: episode_number(os.path.basename(f)))
     print(f"Found {len(txt_files)} screenplay text files in: {input_dir}")
 
     all_screenplay_dfs = []

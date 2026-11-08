@@ -10,6 +10,7 @@ Deployment Target: Streamlit Community Cloud
 import os
 import io
 import glob
+from typing import Optional, List, Dict, Any
 import pandas as pd
 import streamlit as st
 
@@ -76,14 +77,10 @@ def find_latest_manifest() -> Optional[str]:
     if run_manifests:
         return run_manifests[0]
 
-    # Standard locations
-    candidates = [
-        os.path.join("output", "promo_campaign", "promo_campaign_manifest.csv"),
-        os.path.join("output", "gemini_extracted_promos.csv"),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
+    # Standard campaign manifest location
+    standard_manifest = os.path.join("output", "promo_campaign", "promo_campaign_manifest.csv")
+    if os.path.exists(standard_manifest):
+        return standard_manifest
     return None
 
 
@@ -224,7 +221,7 @@ st.sidebar.header("📁 Data Source & Filters")
 uploaded_file = st.sidebar.file_uploader(
     "Upload Extracted Promos Manifest (CSV)",
     type=["csv"],
-    help="Upload promo_campaign_manifest.csv or gemini_extracted_promos.csv."
+    help="Upload promo_campaign_manifest.csv or any promotional clips CSV."
 )
 
 raw_df = load_dataset(uploaded_file)

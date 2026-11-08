@@ -8,6 +8,7 @@ structured LLM prompts.
 
 from typing import List, Dict, Any, Optional
 import pandas as pd
+from script_parser import episode_number
 
 
 def extract_candidate_windows(
@@ -39,7 +40,7 @@ def extract_candidate_windows(
         records = scene_df.reset_index(drop=True)
         num_records = len(records)
 
-        ep = records.loc[0, "Episode"] if "Episode" in records.columns else None
+        ep = episode_number(records.loc[0, "Episode"]) if "Episode" in records.columns else 1
         sc = records.loc[0, "Scene"] if "Scene" in records.columns else None
         sc_heading = records.loc[0, "Scene_Heading"] if "Scene_Heading" in records.columns else None
         ep_logline = records.loc[0, "Episode_Logline"] if "Episode_Logline" in records.columns else None
@@ -86,7 +87,10 @@ def extract_candidate_windows(
                             "Closing_Cliffhanger": f"[{records.loc[end_i, 'Entity_Type']}]: {str(records.loc[end_i, 'Content'])[:80]}",
                         })
 
-    return pd.DataFrame(candidates)
+    df_out = pd.DataFrame(candidates)
+    if not df_out.empty and "Episode" in df_out.columns:
+        df_out["Episode"] = df_out["Episode"].apply(episode_number).astype(int)
+    return df_out
 
 
 def score_and_rank_candidates(candidates_df: pd.DataFrame, top_k: int = 10) -> pd.DataFrame:
