@@ -1,118 +1,224 @@
 """
 End-to-End Microdrama Promotional Clip Pipeline Runner
 ======================================================
-1. Ingests parsed screenplays from output/master_parsed_screenplays.csv
-2. Queries Gemini (gemini-3.5-flash-lite) for 20-60s promo clips
-3. Snaps timestamps to exact dialogue line boundaries
-4. Generates synchronized .srt subtitles for each promo clip
-5. Generates viral marketing copy, hook overlays, and thumbnail timestamps
-6. Generates FFmpeg video slicing & thumbnail extraction batch script
-7. Exports the unified marketing manifest
+Coordinates:
+  1. Screenplay ingestion (from master CSV or parsing raw scripts).
+  2. LLM promotional clip extraction with Gemini and fallback retry logic.
+  3. Deterministic boundary snapping (dialogue starts only; no '...' fragments).
+  4. Synchronized .srt subtitle generation.
+  5. Frame-accurate FFmpeg slicing command generation via generate_ffmpeg_commands.
+  6. Viral marketing creative generation (on-screen hooks, social copy, thumbnail frames).
+  7. Isolated output in timestamped directory: output/run_<YYYYMMDD_HHMMSS>/
 """
 
 import os
 import sys
 import time
+import shutil
 import logging
+import argparse
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 import pandas as pd
-from typing import Optional
 
+from script_parser import parse_screenplay, episode_number
 from gemini_promo_extractor import (
     get_gemini_client,
     prepare_episode_scripts,
     extract_promo_from_episode,
     timecode_to_seconds,
-    seconds_to_timecode
+    seconds_to_timecode,
 )
 from phase3_video_pipeline import (
     snap_clip_to_screenplay_lines,
     generate_promo_srt,
-    seconds_to_ffmpeg_time
+    generate_ffmpeg_commands,
+    seconds_to_ffmpeg_time,
 )
 from marketing_creative_generator import (
     generate_marketing_creatives,
-    calculate_optimal_thumbnail_timestamp
+    calculate_optimal_thumbnail_timestamp,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("EndToEndPipeline")
+logger = logging.getLogger("RunPipeline")
+
+
+def parse_episode_selection(ep_arg: Optional[str], available_episodes: List[int]) -> List[int]:
+    """
+    Parses the --episodes flag:
+      - None -> all available episodes
+      - '1-10' -> range from 1 to 10
+      - '5' -> first 5 episodes (1 to 5)
+    """
+    sorted_eps = sorted(available_episodes)
+    if not ep_arg:
+        return sorted_eps
+
+    ep_str = str(ep_arg).strip()
+    if "-" in ep_str:
+        parts = ep_str.split("-")
+        try:
+            start_num, end_num = int(parts[0].strip()), int(parts[1].strip())
+            return [ep for ep in sorted_eps if start_num <= ep <= end_num]
+        except ValueError:
+            logger.warning("Could not parse episode range '%s'. Running all episodes.", ep_str)
+            return sorted_eps
+    elif ep_str.isdigit():
+        count = int(ep_str)
+        return sorted_eps[:count]
+
+    return sorted_eps
+
+
+def clean_stale_promo_campaign(promo_campaign_dir: str = "output/promo_campaign"):
+    """Removes stale subtitles from output/promo_campaign/ to avoid cross-run contamination."""
+    stale_subtitles = os.path.join(promo_campaign_dir, "subtitles")
+    if os.path.exists(stale_subtitles):
+        try:
+            shutil.rmtree(stale_subtitles)
+            logger.info("Cleaned stale subtitles directory: %s", stale_subtitles)
+        except Exception as e:
+            logger.warning("Could not delete stale subtitles: %s", e)
+
+
+def load_or_create_master_screenplay(
+    master_csv: str = "output/master_parsed_screenplays.csv",
+    scripts_dir: str = os.path.join("Data", "I Married a Broken Soldier. He was a Duke")
+) -> pd.DataFrame:
+    """Loads existing parsed screenplay master CSV or parses from raw scripts."""
+    if os.path.exists(master_csv):
+        logger.info("Loading existing master screenplay CSV: %s", master_csv)
+        df = pd.read_csv(master_csv)
+        df["Episode"] = df["Episode"].apply(episode_number).astype(int)
+        return df
+
+    logger.info("Master screenplay CSV not found at %s. Parsing from %s...", master_csv, scripts_dir)
+    if not os.path.exists(scripts_dir):
+        raise FileNotFoundError(f"Neither {master_csv} nor {scripts_dir} exists.")
+
+    all_dfs = []
+    for root, _, files in os.walk(scripts_dir):
+        for f in sorted(files):
+            if f.endswith(".txt"):
+                p = os.path.join(root, f)
+                df = parse_screenplay(p, include_extended_metadata=True)
+                if not df.empty:
+                    df["Source_File"] = f
+                    all_dfs.append(df)
+
+    if not all_dfs:
+        raise ValueError(f"No valid .txt screenplay files found in {scripts_dir}")
+
+    master_df = pd.concat(all_dfs, ignore_index=True)
+    master_df["Episode"] = master_df["Episode"].apply(episode_number).astype(int)
+    os.makedirs(os.path.dirname(os.path.abspath(master_csv)), exist_ok=True)
+    master_df.to_csv(master_csv, index=False)
+    logger.info("Saved %d parsed screenplay lines to %s", len(master_df), master_csv)
+    return master_df
 
 
 def run_pipeline(
-    master_screenplay_csv: str = "output/master_parsed_screenplays.csv",
-    output_dir: str = "output/promo_campaign",
-    episodes_count: Optional[int] = 5
+    episodes: Optional[str] = None,
+    output_dir: str = "output",
+    master_csv: str = "output/master_parsed_screenplays.csv",
+    scripts_dir: str = os.path.join("Data", "I Married a Broken Soldier. He was a Duke"),
+    min_dur: float = 20.0,
+    max_dur: float = 60.0
 ):
-    os.makedirs(output_dir, exist_ok=True)
-    subtitles_dir = os.path.join(output_dir, "subtitles")
+    # Create isolated timestamped run directory
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(output_dir, f"run_{run_timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    subtitles_dir = os.path.join(run_dir, "subtitles")
     os.makedirs(subtitles_dir, exist_ok=True)
+    failures_csv = os.path.join(run_dir, "failures.csv")
 
-    if not os.path.exists(master_screenplay_csv):
-        logger.error("Master screenplay CSV not found at: %s", master_screenplay_csv)
-        return
+    # Clean stale subtitles from older shared locations
+    clean_stale_promo_campaign()
 
-    logger.info("Loading master screenplay database from: %s", master_screenplay_csv)
-    screenplay_df = pd.read_csv(master_screenplay_csv)
+    logger.info("==================================================================")
+    logger.info("INITIALIZING RUN: %s", run_dir)
+    logger.info("==================================================================")
 
+    # 1. Load screenplay data
+    screenplay_df = load_or_create_master_screenplay(master_csv=master_csv, scripts_dir=scripts_dir)
+
+    # 2. Prepare grouped episode scripts (sorted numerically)
     client = get_gemini_client()
     episode_scripts = prepare_episode_scripts(screenplay_df)
+    all_ep_keys = list(episode_scripts.keys())
 
-    ep_keys = list(episode_scripts.keys())
-    if episodes_count:
-        ep_keys = ep_keys[:episodes_count]
-        logger.info("Running on %d episodes: %s", len(ep_keys), ep_keys)
-    else:
-        logger.info("Running on all %d episodes in database.", len(ep_keys))
+    target_episodes = parse_episode_selection(episodes, all_ep_keys)
+    logger.info(
+        "Targeting %d of %d episodes: %s",
+        len(target_episodes), len(all_ep_keys), target_episodes[:10] + (["..."] if len(target_episodes) > 10 else [])
+    )
 
-    campaign_records = []
+    campaign_records: List[Dict[str, Any]] = []
 
-    for idx, ep_id in enumerate(ep_keys, 1):
-        script_text = episode_scripts[ep_id]
-        logger.info("[%d/%d] Processing Episode %s with Gemini...", idx, len(ep_keys), ep_id)
+    for idx, ep_num in enumerate(target_episodes, 1):
+        script_text = episode_scripts[ep_num]
+        logger.info("[%d/%d] Processing Episode %d with Gemini...", idx, len(target_episodes), ep_num)
 
-        promos = extract_promo_from_episode(client, ep_id, script_text)
+        promos = extract_promo_from_episode(
+            client=client,
+            episode_id=ep_num,
+            script_text=script_text,
+            failures_csv=failures_csv
+        )
+
         if not promos:
-            logger.warning("No promo returned for Episode %s. Skipping.", ep_id)
+            logger.warning("Episode %d produced no promotional clips. Recorded in %s", ep_num, failures_csv)
             continue
 
         for p in promos:
-            raw_start_tc = p.get("start_time")
-            raw_end_tc = p.get("end_time")
+            raw_start_tc = str(p.get("start_time", ""))
+            raw_end_tc = str(p.get("end_time", ""))
+            raw_start_sec = timecode_to_seconds(raw_start_tc)
+            raw_end_sec = timecode_to_seconds(raw_end_tc)
+            raw_dur_sec = round(raw_end_sec - raw_start_sec, 2)
 
-            # Snap to line-level timestamps
+            # Snap strictly to dialogue line starts (no CAMERA/ACTION, no continuation '...')
             snapped = snap_clip_to_screenplay_lines(
                 screenplay_df=screenplay_df,
-                episode_id=ep_id,
+                episode_id=ep_num,
                 llm_start_tc=raw_start_tc,
                 llm_end_tc=raw_end_tc,
-                min_dur=20.0,
-                max_dur=60.0
+                min_dur=min_dur,
+                max_dur=max_dur
             )
 
-            if not snapped:
-                s_start = timecode_to_seconds(raw_start_tc)
-                s_end = timecode_to_seconds(raw_end_tc)
-                s_dur = round(s_end - s_start, 2)
-            else:
+            if snapped is not None:
                 s_start, s_end, s_dur = snapped
-
-            clean_ep_name = str(ep_id).replace(" ", "_")
-            srt_filename = f"promo_ep{clean_ep_name}_{int(s_start)}s_{int(s_end)}s.srt"
-            srt_path = os.path.join(subtitles_dir, srt_filename)
+                status = "valid"
+            else:
+                # Do NOT silently fall back to unverified out-of-bounds times
+                logger.warning(
+                    "Episode %d: Snapping failed to find valid 20-60s dialogue-started window. Marked as needs_review.",
+                    ep_num
+                )
+                s_start = raw_start_sec
+                s_end = raw_end_sec
+                s_dur = raw_dur_sec
+                status = "needs_review"
 
             # Generate Subtitle file (.srt)
+            srt_filename = f"promo_ep{ep_num}_{int(s_start)}s_{int(s_end)}s.srt"
+            srt_path = os.path.join(subtitles_dir, srt_filename)
+
             generate_promo_srt(
                 screenplay_df=screenplay_df,
-                episode_id=ep_id,
+                episode_id=ep_num,
                 clip_start_sec=s_start,
                 clip_end_sec=s_end,
                 output_srt_path=srt_path,
                 include_speaker_names=True
             )
 
-            # Extract dialogue transcript for creative generation
+            # Generate marketing ad creatives
             clip_mask = (
-                (screenplay_df["Episode"].astype(str) == str(ep_id)) &
+                (screenplay_df["Episode"].apply(episode_number) == ep_num) &
                 (screenplay_df["Start_Sec"] >= s_start - 0.05) &
                 (screenplay_df["End_Sec"] <= s_end + 0.05)
             )
@@ -121,17 +227,16 @@ def run_pipeline(
                 f"{r.get('Entity_Type', '')}: {r.get('Content', '')}" for _, r in clip_lines.iterrows()
             ])
 
-            # Phase 4: Marketing Creative Packaging
             creatives = generate_marketing_creatives(
                 client=client,
-                episode_id=ep_id,
+                episode_id=ep_num,
                 hook_desc=p.get("hook_description", ""),
                 cliffhanger_desc=p.get("cliffhanger_description", ""),
                 transcript_text=clip_dialogue
             )
             thumbnail_sec = calculate_optimal_thumbnail_timestamp(
                 screenplay_df=screenplay_df,
-                episode_id=ep_id,
+                episode_id=ep_num,
                 clip_start_sec=s_start,
                 clip_end_sec=s_end
             )
@@ -142,9 +247,10 @@ def run_pipeline(
             hook_3 = hook_opts[2] if len(hook_opts) > 2 else ""
 
             campaign_records.append({
-                "Episode": ep_id,
-                "Start_Timecode": seconds_to_timecode(s_start),
-                "End_Timecode": seconds_to_timecode(s_end),
+                "Episode": int(ep_num),
+                "Status": status,
+                "Start_Time": seconds_to_timecode(s_start),
+                "End_Time": seconds_to_timecode(s_end),
                 "Exact_Start_Sec": s_start,
                 "Exact_End_Sec": s_end,
                 "Duration_Sec": s_dur,
@@ -161,44 +267,82 @@ def run_pipeline(
                 "Justification": p.get("justification")
             })
 
-        time.sleep(1.0)  # Pacing between calls
+        time.sleep(1.0)  # Pacing between LLM requests
 
     if not campaign_records:
-        logger.warning("No campaign records generated.")
+        logger.error("No campaign records generated across requested episodes.")
         return
 
     campaign_df = pd.DataFrame(campaign_records)
-    manifest_csv = os.path.join(output_dir, "promo_campaign_manifest.csv")
+    campaign_df["Episode"] = campaign_df["Episode"].apply(episode_number).astype(int)
+
+    # Save manifest into timestamped run directory
+    manifest_csv = os.path.join(run_dir, "promo_campaign_manifest.csv")
     campaign_df.to_csv(manifest_csv, index=False)
-    logger.info("[SUCCESS] Generated comprehensive campaign manifest with %d clips -> %s", len(campaign_df), manifest_csv)
+    logger.info("[SUCCESS] Generated campaign manifest with %d clips -> %s", len(campaign_df), manifest_csv)
 
-    # Generate FFmpeg batch script for slicing clips AND extracting thumbnails
-    bat_lines = ["@echo off", "mkdir clips 2>nul", "mkdir thumbnails 2>nul\n"]
-    for _, r in campaign_df.iterrows():
-        ep = str(r["Episode"]).replace(" ", "_")
-        t_start = seconds_to_ffmpeg_time(r["Exact_Start_Sec"])
-        t_dur = seconds_to_ffmpeg_time(r["Duration_Sec"])
-        t_thumb = seconds_to_ffmpeg_time(r["Thumbnail_Frame_Sec"])
+    # Also update promo_campaign directory for Streamlit dashboard access
+    shared_manifest_dir = os.path.join("output", "promo_campaign")
+    os.makedirs(shared_manifest_dir, exist_ok=True)
+    shared_manifest_csv = os.path.join(shared_manifest_dir, "promo_campaign_manifest.csv")
+    campaign_df.to_csv(shared_manifest_csv, index=False)
 
-        in_vid = f"raw_videos/episode_{ep}.mp4"
-        out_clip = f"clips/promo_ep{ep}_{int(r['Exact_Start_Sec'])}s_to_{int(r['Exact_End_Sec'])}s.mp4"
-        out_thumb = f"thumbnails/thumb_ep{ep}_{int(r['Thumbnail_Frame_Sec'])}s.jpg"
+    # Copy new subtitles into shared promo_campaign/subtitles/
+    shared_subtitles_dir = os.path.join(shared_manifest_dir, "subtitles")
+    os.makedirs(shared_subtitles_dir, exist_ok=True)
+    for srt_file in os.listdir(subtitles_dir):
+        shutil.copy2(os.path.join(subtitles_dir, srt_file), os.path.join(shared_subtitles_dir, srt_file))
 
-        bat_lines.append(f'rem --- Episode {ep} Promo & Thumbnail ---')
-        bat_lines.append(f'ffmpeg -y -ss {t_start} -i "{in_vid}" -t {t_dur} -c:v libx264 -crf 18 -preset fast -c:a aac "{out_clip}"')
-        bat_lines.append(f'ffmpeg -y -ss {t_thumb} -i "{in_vid}" -vframes 1 -q:v 2 "{out_thumb}"\n')
-
-    bat_path = os.path.join(output_dir, "slice_promos.bat")
+    # Generate FFmpeg batch script using phase3_video_pipeline.generate_ffmpeg_commands
+    bat_commands = generate_ffmpeg_commands(
+        promos_df=campaign_df,
+        video_source_dir="raw_videos",
+        output_dir="clips",
+        script_type="bat"
+    )
+    bat_path = os.path.join(run_dir, "slice_promos.bat")
     with open(bat_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(bat_lines))
-    logger.info("[SUCCESS] Generated FFmpeg slicing & thumbnail batch script -> %s", bat_path)
+        f.write(bat_commands)
+    shutil.copy2(bat_path, os.path.join(shared_manifest_dir, "slice_promos.bat"))
+    logger.info("[SUCCESS] Generated FFmpeg slicing script -> %s", bat_path)
 
     print("\n" + "="*80)
-    print("PROMOTIONAL MARKETING CAMPAIGN MANIFEST (SAMPLE):")
+    print("PROMOTIONAL MARKETING CAMPAIGN RUN SUMMARY:")
     print("="*80)
-    print(campaign_df[["Episode", "Duration_Sec", "On_Screen_Hook_1", "Social_Caption"]].to_string())
+    print(campaign_df[["Episode", "Status", "Start_Time", "End_Time", "Duration_Sec", "On_Screen_Hook_1"]].to_string())
 
 
 if __name__ == "__main__":
-    count = int(sys.argv[1]) if len(sys.argv) > 1 else None
-    run_pipeline(episodes_count=count)
+    parser = argparse.ArgumentParser(description="End-to-End Microdrama Promotional Pipeline")
+    parser.add_argument(
+        "--episodes",
+        type=str,
+        default=None,
+        help="Optional episode count (e.g. 5) or range (e.g. 1-10). If omitted, runs all episodes."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output",
+        help="Base output directory (default: output)"
+    )
+    parser.add_argument(
+        "--master_csv",
+        type=str,
+        default="output/master_parsed_screenplays.csv",
+        help="Path to master parsed screenplay CSV"
+    )
+    parser.add_argument(
+        "--scripts_dir",
+        type=str,
+        default=os.path.join("Data", "I Married a Broken Soldier. He was a Duke"),
+        help="Directory containing screenplay .txt files"
+    )
+
+    args = parser.parse_args()
+    run_pipeline(
+        episodes=args.episodes,
+        output_dir=args.output_dir,
+        master_csv=args.master_csv,
+        scripts_dir=args.scripts_dir
+    )

@@ -10,8 +10,8 @@ if "%~1"=="" (
     set "COMMIT_MSG=%~1"
 )
 
-echo [1/3] Staging all changes...
-git add .
+echo [1/3] Staging tracked code files only...
+git add -u
 
 echo [2/3] Committing with message: "%COMMIT_MSG%"...
 git commit -m "%COMMIT_MSG%"
@@ -28,4 +28,3 @@ if %errorlevel% equ 0 (
     echo.
     echo [ERROR] Push failed. Check your internet connection or credentials.
 )
-

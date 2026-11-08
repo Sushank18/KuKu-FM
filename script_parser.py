@@ -15,6 +15,22 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def episode_number(x: Any) -> int:
+    """
+    Extracts the first integer from any episode representation.
+    
+    Examples:
+        'Episode 12' -> 12
+        '12' -> 12
+        12 -> 12
+        'episode-001-Episode 1671703.txt' -> 1
+    """
+    if isinstance(x, (int, float)) and not pd.isna(x):
+        return int(x)
+    match = re.search(r"\d+", str(x))
+    return int(match.group()) if match else 0
+
+
 def time_to_seconds(time_str: str) -> float:
     """
     Converts a timestamp string into total seconds as a float.
@@ -163,7 +179,7 @@ def parse_screenplay(
         # 1. Episode header
         ep_m = EPISODE_PATTERN.match(line)
         if ep_m:
-            current_episode = ep_m.group("episode").strip()
+            current_episode = episode_number(ep_m.group("episode").strip())
             i += 1
             continue
 
@@ -291,7 +307,10 @@ def parse_screenplay(
     else:
         cols = core_cols
 
-    return pd.DataFrame(records, columns=cols)
+    df = pd.DataFrame(records, columns=cols)
+    if "Episode" in df.columns:
+        df["Episode"] = df["Episode"].apply(episode_number).astype(int)
+    return df
 
 
 if __name__ == "__main__":

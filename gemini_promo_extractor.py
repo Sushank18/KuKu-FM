@@ -2,7 +2,8 @@
 Microdrama Promotional Clip Extraction Pipeline - Phase 2 (Gemini API Integration)
 ===================================================================================
 Uses Google GenAI SDK to identify 20-to-60-second standalone promotional clips
-with strict hook and cliffhanger constraints and JSON schema validation.
+with strict hook and cliffhanger constraints, duration validation, retry logic,
+and structured JSON schema output.
 """
 
 import os
@@ -15,15 +16,24 @@ import pandas as pd
 from google import genai
 from google.genai import types
 
+from script_parser import episode_number
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("GeminiPromoExtractor")
+
+# Dynamic model configuration from environment
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+FALLBACK_MODELS_ENV = os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash,gemini-flash-latest")
+FALLBACK_MODELS = [m.strip() for m in FALLBACK_MODELS_ENV.split(",") if m.strip()]
+
 
 def get_gemini_client() -> genai.Client:
     """Initializes and returns the Google GenAI client using the active API key."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError(
-            "GEMINI_API_KEY is not set. Please set the GEMINI_API_KEY environment variable."
+            "GEMINI_API_KEY environment variable is not set. "
+            "Please set GEMINI_API_KEY in your environment before running."
         )
     return genai.Client(api_key=api_key)
 
@@ -57,16 +67,19 @@ def timecode_to_seconds(tc: str) -> float:
     return 0.0
 
 
-def prepare_episode_scripts(df: pd.DataFrame) -> Dict[str, str]:
+def prepare_episode_scripts(df: pd.DataFrame) -> Dict[int, str]:
     """
     Groups screenplay lines by Episode and formats them chronologically
-    with precise timecodes and character dialogues.
+    with precise timecodes and character dialogues, sorted numerically by Episode.
     """
-    episode_scripts: Dict[str, str] = {}
-    sorted_df = df.sort_values(by=["Episode", "Start_Sec"]).copy()
+    episode_scripts: Dict[int, str] = {}
+    work_df = df.copy()
+    work_df["Episode"] = work_df["Episode"].apply(episode_number)
+    sorted_df = work_df.sort_values(by=["Episode", "Start_Sec"])
 
-    for ep_id, group in sorted_df.groupby("Episode", sort=False):
-        lines: List[str] = [f"=== EPISODE {ep_id} SCREENPLAY TRANSCRIPT ===\n"]
+    for ep_id, group in sorted_df.groupby("Episode", sort=True):
+        ep_num = int(ep_id)
+        lines: List[str] = [f"=== EPISODE {ep_num} SCREENPLAY TRANSCRIPT ===\n"]
         for _, row in group.iterrows():
             start_tc = seconds_to_timecode(row["Start_Sec"])
             end_tc = seconds_to_timecode(row["End_Sec"])
@@ -81,7 +94,7 @@ def prepare_episode_scripts(df: pd.DataFrame) -> Dict[str, str]:
 
             lines.append(f"[{start_tc} - {end_tc}] {speaker}{content}")
 
-        episode_scripts[str(ep_id)] = "\n".join(lines)
+        episode_scripts[ep_num] = "\n".join(lines)
     return episode_scripts
 
 
@@ -144,28 +157,69 @@ Return strictly valid JSON matching the schema.
 """
 
 
+def is_rate_limit_or_server_error(exc: Exception) -> bool:
+    """Detects HTTP 429 (rate limit) or 503 (server unavailable) from exceptions."""
+    err_str = str(exc).lower()
+    status_code = getattr(exc, "status_code", getattr(exc, "code", None))
+    return (
+        status_code in (429, 503)
+        or "429" in err_str
+        or "503" in err_str
+        or "resource_exhausted" in err_str
+        or "rate limit" in err_str
+        or "unavailable" in err_str
+    )
+
+
+def record_failure(failures_csv: str, episode_id: Any, reason: str):
+    """Appends an episode processing failure to failures.csv."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(failures_csv)), exist_ok=True)
+        file_exists = os.path.exists(failures_csv)
+        with open(failures_csv, "a", encoding="utf-8") as f:
+            if not file_exists:
+                f.write("Episode,Reason\n")
+            clean_reason = str(reason).replace('"', '""').replace("\n", " ")
+            f.write(f'{episode_id},"{clean_reason}"\n')
+    except Exception as e:
+        logger.error("Could not write failure to %s: %s", failures_csv, e)
+
+
 def extract_promo_from_episode(
     client: genai.Client,
-    episode_id: str,
+    episode_id: Any,
     script_text: str,
-    model_name: str = "gemini-3.5-flash-lite",
-    max_retries: int = 3
+    failures_csv: str = "output/failures.csv",
+    max_retries: int = 2
 ) -> List[Dict[str, Any]]:
     """
-    Sends the episode script to Gemini, parses and validates the returned promo clips.
+    Sends the episode script to Gemini:
+    - Tries DEFAULT_MODEL and falls back to FALLBACK_MODELS.
+    - Handles rate limits (429) and server spikes (503) with exponential backoff.
+    - Retries ONCE with specific duration error feedback if clip duration is outside 20-60s.
+    - Never retries identically more than twice.
+    - Records persistent failures to failures.csv.
     """
-    prompt = f"Analyze Episode {episode_id} and extract the best 20-60 second promo clip:\n\n{script_text}"
+    ep_num = episode_number(episode_id)
+    base_prompt = f"Analyze Episode {ep_num} and extract the best 20-60 second promo clip:\n\n{script_text}"
 
-    # Priority models to try in case of temporary 503 traffic spikes on one model
-    models_to_try = [model_name, "gemini-3.5-flash", "gemini-flash-latest"]
+    # Build model candidate list from environment
+    all_models = [DEFAULT_MODEL] + [m for m in FALLBACK_MODELS if m != DEFAULT_MODEL]
+    last_error_reason = "No models available"
 
-    for current_model in models_to_try:
+    for current_model in all_models:
+        current_prompt = base_prompt
+        duration_retry_done = False
+
         for attempt in range(1, max_retries + 1):
             try:
-                logger.info("Extracting promo for Episode %s using %s (Attempt %d)...", episode_id, current_model, attempt)
+                logger.info(
+                    "Querying Gemini for Episode %s using %s (Attempt %d/%d)...",
+                    ep_num, current_model, attempt, max_retries
+                )
                 response = client.models.generate_content(
                     model=current_model,
-                    contents=prompt,
+                    contents=current_prompt,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
                         response_mime_type="application/json",
@@ -174,11 +228,17 @@ def extract_promo_from_episode(
                     )
                 )
 
-                raw_text = response.text.strip()
+                raw_text = response.text.strip() if response.text else ""
+                if not raw_text:
+                    last_error_reason = "Empty response received from model"
+                    continue
+
                 data = json.loads(raw_text)
                 promos = data.get("promos", [])
 
                 validated: List[Dict[str, Any]] = []
+                out_of_bounds_durations = []
+
                 for p in promos:
                     start_sec = timecode_to_seconds(p.get("start_time", ""))
                     end_sec = timecode_to_seconds(p.get("end_time", ""))
@@ -188,46 +248,76 @@ def extract_promo_from_episode(
                     if 20.0 <= duration <= 60.0:
                         validated.append(p)
                     else:
-                        logger.warning(
-                            "Clip for Episode %s duration %.2fs outside [20, 60]s: %s to %s",
-                            episode_id, duration, p.get("start_time"), p.get("end_time")
-                        )
+                        out_of_bounds_durations.append((duration, p.get("start_time"), p.get("end_time")))
 
                 if validated:
                     return validated
 
-            except Exception as e:
-                logger.warning("Attempt %d with %s failed for Episode %s: %s", attempt, current_model, episode_id, e)
-                if "503" in str(e):
-                    # If model is unavailable, immediately fall back to the next model
-                    break
-                time.sleep(2.0 * attempt)
+                # If duration was outside 20-60s, retry ONCE with specific duration feedback
+                if out_of_bounds_durations and not duration_retry_done:
+                    bad_dur, bad_s, bad_e = out_of_bounds_durations[0]
+                    duration_retry_done = True
+                    logger.warning(
+                        "Episode %s: Model returned clip outside 20-60s (%.1fs, %s to %s). Retrying with targeted prompt...",
+                        ep_num, bad_dur, bad_s, bad_e
+                    )
+                    current_prompt = (
+                        f"{base_prompt}\n\n"
+                        f"CRITICAL CORRECTION REQUIRED: Your previous choice from {bad_s} to {bad_e} was {bad_dur:.1f}s. "
+                        f"The promo clip duration MUST be strictly between 20.0 and 60.0 seconds. "
+                        f"Pick line timestamps so that (End Time - Start Time) is strictly between 20 and 60 seconds."
+                    )
+                    time.sleep(1.0)
+                    continue  # Retry with correction prompt
 
+                last_error_reason = f"Clips outside duration constraints: {out_of_bounds_durations}"
+
+            except Exception as e:
+                last_error_reason = str(e)
+                logger.warning("Attempt %d with %s failed for Episode %s: %s", attempt, current_model, ep_num, e)
+
+                if is_rate_limit_or_server_error(e):
+                    # Exponential backoff for rate limit (429) or 503
+                    backoff = 2.0 ** attempt
+                    logger.info("Rate limit / 503 detected. Backing off for %.1fs...", backoff)
+                    time.sleep(backoff)
+                else:
+                    # Non-retriable or structural error
+                    time.sleep(1.0)
+
+        # If current_model exhausted all retries, loop continues to next fallback model
+        logger.info("Switching from %s to next fallback model...", current_model)
+
+    # If all models and retries failed, log and write to failures.csv
+    logger.error("Episode %s failed all attempts across all models. Logging to %s", ep_num, failures_csv)
+    record_failure(failures_csv, ep_num, last_error_reason)
     return []
 
 
 def run_gemini_extraction(
     screenplay_df: pd.DataFrame,
     episodes_limit: Optional[int] = None,
-    output_csv: str = "output/gemini_extracted_promos.csv"
+    output_csv: str = "output/gemini_extracted_promos.csv",
+    failures_csv: str = "output/failures.csv"
 ) -> pd.DataFrame:
     """
-    Runs the complete Gemini extraction across episodes and flattens into a DataFrame.
+    Runs Gemini extraction across episodes and returns a DataFrame with Episode as int.
     """
     client = get_gemini_client()
     episode_scripts = prepare_episode_scripts(screenplay_df)
 
+    sorted_ep_keys = sorted(episode_scripts.keys())
     if episodes_limit:
-        keys = list(episode_scripts.keys())[:episodes_limit]
-        episode_scripts = {k: episode_scripts[k] for k in keys}
+        sorted_ep_keys = sorted_ep_keys[:episodes_limit]
 
     records: List[Dict[str, Any]] = []
 
-    for ep_id, script in episode_scripts.items():
-        promos = extract_promo_from_episode(client, ep_id, script)
+    for ep_id in sorted_ep_keys:
+        script = episode_scripts[ep_id]
+        promos = extract_promo_from_episode(client, ep_id, script, failures_csv=failures_csv)
         for p in promos:
             records.append({
-                "Episode": p.get("episode", ep_id),
+                "Episode": episode_number(p.get("episode", ep_id)),
                 "Start_Time": p.get("start_time"),
                 "End_Time": p.get("end_time"),
                 "Duration_Sec": p.get("duration_sec"),
@@ -247,19 +337,10 @@ def run_gemini_extraction(
         "Justification"
     ]
     df_results = pd.DataFrame(records, columns=cols)
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    if "Episode" in df_results.columns:
+        df_results["Episode"] = df_results["Episode"].apply(episode_number).astype(int)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
     df_results.to_csv(output_csv, index=False)
     logger.info("Saved %d extracted promos to %s", len(df_results), output_csv)
     return df_results
-
-
-if __name__ == "__main__":
-    from script_parser import parse_screenplay
-
-    # Test run on Episode 1 from the workspace
-    sample_file = os.path.join("Data", "I Married a Broken Soldier. He was a Duke", "episode-001-Episode 1671703.txt")
-    if os.path.exists(sample_file):
-        df_ep1 = parse_screenplay(sample_file)
-        results = run_gemini_extraction(df_ep1, episodes_limit=1)
-        print("\n=== EXTRACTED PROMO RESULT ===")
-        print(results.to_string())

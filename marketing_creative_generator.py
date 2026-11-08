@@ -12,8 +12,10 @@ from typing import Dict, Any, List, Optional
 import pandas as pd
 from google import genai
 from google.genai import types
+from script_parser import episode_number
 
 logger = logging.getLogger("CreativeGenerator")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 CREATIVE_JSON_SCHEMA = {
     "type": "OBJECT",
@@ -48,7 +50,7 @@ CREATIVE_JSON_SCHEMA = {
 
 def calculate_optimal_thumbnail_timestamp(
     screenplay_df: pd.DataFrame,
-    episode_id: str,
+    episode_id: Any,
     clip_start_sec: float,
     clip_end_sec: float
 ) -> float:
@@ -56,7 +58,8 @@ def calculate_optimal_thumbnail_timestamp(
     Deterministically locates the optimal freeze-frame timestamp for a video thumbnail.
     Prioritizes camera close-ups and lines with peak emotional shock/tears/rage.
     """
-    ep_df = screenplay_df[screenplay_df["Episode"].astype(str) == str(episode_id)]
+    ep_num = episode_number(episode_id)
+    ep_df = screenplay_df[screenplay_df["Episode"].apply(episode_number) == ep_num]
     mask = (ep_df["Start_Sec"] >= clip_start_sec) & (ep_df["End_Sec"] <= clip_end_sec)
     clip_df = ep_df[mask]
 
@@ -77,15 +80,16 @@ def calculate_optimal_thumbnail_timestamp(
 
 def generate_marketing_creatives(
     client: genai.Client,
-    episode_id: str,
+    episode_id: Any,
     hook_desc: str,
     cliffhanger_desc: str,
     transcript_text: str,
-    model_name: str = "gemini-3.5-flash-lite"
+    model_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Uses Gemini to generate high-converting promotional copy and on-screen text overlays.
     """
+    target_model = model_name or DEFAULT_MODEL
     prompt = f"""
 You are a viral growth marketer for vertical microdrama apps (like ReelShort, ShortMax, KuKu FM).
 Generate creative promotional ad metadata for this approved clip:
@@ -102,7 +106,7 @@ Provide 3 punchy on-screen text overlays (under 7 words each), a viral social ca
 
     try:
         response = client.models.generate_content(
-            model=model_name,
+            model=target_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
