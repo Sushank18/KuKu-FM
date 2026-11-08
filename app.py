@@ -238,8 +238,35 @@ with st.expander("ℹ️ How the Extraction Pipeline Operates", expanded=False):
 
 
 # ==============================================================================
-# 5. SIDEBAR: DATA LOADING & FILTER CONTROLS
+# 5. SIDEBAR: DATA LOADING, API KEY & FILTER CONTROLS
 # ==============================================================================
+st.sidebar.header("🔑 API Configuration")
+
+# Secure API Key lookup with multi-tier fallback
+default_secret_key = ""
+try:
+    if "GEMINI_API_KEY" in st.secrets:
+        default_secret_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    pass
+
+if not default_secret_key:
+    default_secret_key = os.getenv("GEMINI_API_KEY", "")
+
+gemini_key_input = st.sidebar.text_input(
+    "Google Gemini API Key:",
+    value=default_secret_key if default_secret_key else "",
+    type="password",
+    help="Add your API key here or configure it in Streamlit Cloud Settings > Secrets."
+)
+
+if gemini_key_input:
+    os.environ["GEMINI_API_KEY"] = gemini_key_input
+    st.sidebar.success("✅ Gemini API Key Active")
+else:
+    st.sidebar.warning("⚠️ No Gemini API Key set (using pre-extracted data).")
+
+st.sidebar.markdown("---")
 st.sidebar.header("📁 Data Source & Filters")
 
 # File Uploader
