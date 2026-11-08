@@ -1,0 +1,27 @@
+1
+00:00:00,200 --> 00:00:02,000
+GERALD: You have thrown yourself away!
+
+2
+00:00:02,200 --> 00:00:04,200
+GERALD: For a penniless nobody!
+
+3
+00:00:05,700 --> 00:00:08,000
+JULIANA: I would rather choose my own life...
+
+4
+00:00:08,200 --> 00:00:10,700
+JULIANA: ...than spend another moment begging for yours.
+
+5
+00:00:12,700 --> 00:00:16,700
+LADY ASHCROFT: Do not bring this man anywhere near Ashcroft Manor!
+
+6
+00:00:17,200 --> 00:00:19,700
+LADY ASHCROFT: You are disowned!
+
+7
+00:00:24,700 --> 00:00:26,000
+MYSTERIOUS BEARDED MAN: Come, Lady Juliana.
