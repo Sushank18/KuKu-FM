@@ -28,3 +28,4 @@ if %errorlevel% equ 0 (
     echo.
     echo [ERROR] Push failed. Check your internet connection or credentials.
 )
+
