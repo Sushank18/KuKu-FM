@@ -10,9 +10,8 @@ import json
 import logging
 from typing import Dict, Any, List, Optional
 import pandas as pd
-from google import genai
-from google.genai import types
 from script_parser import episode_number
+from llm_client import generate_json
 
 logger = logging.getLogger("CreativeGenerator")
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
@@ -79,15 +78,17 @@ def calculate_optimal_thumbnail_timestamp(
 
 
 def generate_marketing_creatives(
-    client: genai.Client,
-    episode_id: Any,
-    hook_desc: str,
-    cliffhanger_desc: str,
-    transcript_text: str,
-    model_name: Optional[str] = None
+    client: Any = None,
+    episode_id: Any = 1,
+    hook_desc: str = "",
+    cliffhanger_desc: str = "",
+    transcript_text: str = "",
+    model_name: Optional[str] = None,
+    api_key: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Uses Gemini to generate high-converting promotional copy and on-screen text overlays.
+    Uses centralized LLM client to generate high-converting promotional copy and on-screen text overlays.
     """
     target_model = model_name or DEFAULT_MODEL
     prompt = f"""
@@ -105,16 +106,15 @@ Provide 3 punchy on-screen text overlays (under 7 words each), a viral social ca
 """
 
     try:
-        response = client.models.generate_content(
+        return generate_json(
+            prompt=prompt,
+            schema=CREATIVE_JSON_SCHEMA,
+            system_instruction="You are a viral growth marketer for microdramas. Output valid JSON matching schema.",
             model=target_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=CREATIVE_JSON_SCHEMA,
-                temperature=0.4,
-            )
+            api_key=api_key,
+            provider=provider,
+            temperature=0.4,
         )
-        return json.loads(response.text.strip())
     except Exception as e:
         logger.warning("Creative generation fallback for Episode %s: %s", episode_id, e)
         return {

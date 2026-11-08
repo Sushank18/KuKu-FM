@@ -31,6 +31,17 @@ def episode_number(x: Any) -> int:
     return int(match.group()) if match else 0
 
 
+def parse_line_id(line_id: str) -> tuple[int, int]:
+    """
+    Parses a Line_ID such as 'E12-L034' or 'E1-L005' into (episode, line_number).
+    Returns (0, 0) if unparseable.
+    """
+    match = re.match(r"^E(\d+)-L(\d+)$", str(line_id).strip(), re.IGNORECASE)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return 0, 0
+
+
 def time_to_seconds(time_str: str) -> float:
     """
     Converts a timestamp string into total seconds as a float.
@@ -73,6 +84,12 @@ EPISODE_PATTERN = re.compile(
 # 2. Episode logline: e.g. "EPISODE LOGLINE: Lady Juliana arrives..."
 LOGLINE_PATTERN = re.compile(
     r"^EPISODE\s+LOGLINE\s*:\s*(?P<logline>.+?)$",
+    re.IGNORECASE,
+)
+
+# 2b. Continuity notes: e.g. "CONTINUITY NOTES: First episode of the series..."
+CONTINUITY_PATTERN = re.compile(
+    r"^CONTINUITY(?:\s+NOTES)?\s*:\s*(?P<notes>.+?)$",
     re.IGNORECASE,
 )
 
@@ -159,10 +176,12 @@ def parse_screenplay(
         text = str(source)
 
     records: List[Dict[str, Any]] = []
-    current_episode: Optional[str] = None
+    current_episode: Optional[int] = None
     current_logline: Optional[str] = None
+    current_continuity: Optional[str] = None
     current_scene: Optional[str] = None
     current_heading: Optional[str] = None
+    episode_line_counter: int = 0
 
     lines = text.splitlines()
     i = 0
@@ -180,6 +199,8 @@ def parse_screenplay(
         ep_m = EPISODE_PATTERN.match(line)
         if ep_m:
             current_episode = episode_number(ep_m.group("episode").strip())
+            current_continuity = None
+            episode_line_counter = 0
             i += 1
             continue
 
@@ -187,6 +208,13 @@ def parse_screenplay(
         log_m = LOGLINE_PATTERN.match(line)
         if log_m:
             current_logline = log_m.group("logline").strip()
+            i += 1
+            continue
+
+        # 2b. Continuity notes
+        cont_m = CONTINUITY_PATTERN.match(line)
+        if cont_m:
+            current_continuity = cont_m.group("notes").strip()
             i += 1
             continue
 
@@ -216,8 +244,11 @@ def parse_screenplay(
                 end_sec = time_to_seconds(single_m.group("end"))
                 content = single_m.group("content").strip()
                 entity, emotion = extract_entity_and_emotion(raw_tag)
+                episode_line_counter += 1
+                line_id = f"E{current_episode}-L{episode_line_counter:03d}"
 
                 record = {
+                    "Line_ID": line_id,
                     "Episode": current_episode,
                     "Scene": current_scene,
                     "Entity_Type": entity,
@@ -229,6 +260,7 @@ def parse_screenplay(
                 }
                 if include_extended_metadata:
                     record["Episode_Logline"] = current_logline
+                    record["Continuity_Notes"] = current_continuity
                     record["Scene_Heading"] = current_heading
                     record["Line_Index"] = len(records)
                 records.append(record)
@@ -272,7 +304,11 @@ def parse_screenplay(
                     i += 1
 
                 content = " ".join(content_parts).strip()
+                episode_line_counter += 1
+                line_id = f"E{current_episode}-L{episode_line_counter:03d}"
+
                 record = {
+                    "Line_ID": line_id,
                     "Episode": current_episode,
                     "Scene": current_scene,
                     "Entity_Type": entity,
@@ -284,6 +320,7 @@ def parse_screenplay(
                 }
                 if include_extended_metadata:
                     record["Episode_Logline"] = current_logline
+                    record["Continuity_Notes"] = current_continuity
                     record["Scene_Heading"] = current_heading
                     record["Line_Index"] = len(records)
                 records.append(record)
@@ -293,6 +330,7 @@ def parse_screenplay(
         i += 1
 
     core_cols = [
+        "Line_ID",
         "Episode",
         "Scene",
         "Entity_Type",
@@ -303,7 +341,7 @@ def parse_screenplay(
         "Content",
     ]
     if include_extended_metadata:
-        cols = core_cols + ["Episode_Logline", "Scene_Heading", "Line_Index"]
+        cols = core_cols + ["Episode_Logline", "Continuity_Notes", "Scene_Heading", "Line_Index"]
     else:
         cols = core_cols
 

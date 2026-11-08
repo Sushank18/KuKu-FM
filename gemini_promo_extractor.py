@@ -13,9 +13,7 @@ import time
 import logging
 from typing import Dict, Any, List, Optional
 import pandas as pd
-from google import genai
-from google.genai import types
-
+from llm_client import generate_json
 from script_parser import episode_number
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -27,15 +25,9 @@ FALLBACK_MODELS_ENV = os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash,gemi
 FALLBACK_MODELS = [m.strip() for m in FALLBACK_MODELS_ENV.split(",") if m.strip()]
 
 
-def get_gemini_client() -> genai.Client:
-    """Initializes and returns the Google GenAI client using the active API key."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "GEMINI_API_KEY environment variable is not set. "
-            "Please set GEMINI_API_KEY in your environment before running."
-        )
-    return genai.Client(api_key=api_key)
+def get_gemini_client():
+    """Returns None as centralized client calls llm_client directly."""
+    return None
 
 
 def seconds_to_timecode(seconds: float) -> str:
@@ -217,23 +209,13 @@ def extract_promo_from_episode(
                     "Querying Gemini for Episode %s using %s (Attempt %d/%d)...",
                     ep_num, current_model, attempt, max_retries
                 )
-                response = client.models.generate_content(
+                data = generate_json(
+                    prompt=current_prompt,
+                    schema=PROMO_JSON_SCHEMA,
+                    system_instruction=SYSTEM_INSTRUCTION,
                     model=current_model,
-                    contents=current_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_INSTRUCTION,
-                        response_mime_type="application/json",
-                        response_schema=PROMO_JSON_SCHEMA,
-                        temperature=0.2,
-                    )
+                    temperature=0.2,
                 )
-
-                raw_text = response.text.strip() if response.text else ""
-                if not raw_text:
-                    last_error_reason = "Empty response received from model"
-                    continue
-
-                data = json.loads(raw_text)
                 promos = data.get("promos", [])
 
                 validated: List[Dict[str, Any]] = []

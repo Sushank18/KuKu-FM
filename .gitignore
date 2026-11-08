@@ -17,3 +17,4 @@ secrets.toml
 Data/
 output/master_parsed_screenplays.csv
 output/candidate_promo_clips_20_60s.csv
+output/**/subtitles/

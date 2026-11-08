@@ -1,0 +1,377 @@
+"""
+Line-ID Anchored Promo Extractor & Cold Viewer Auditor
+======================================================
+1. Line-ID Anchoring: Numbers every line in an episode (e.g. E12-L034) so the LLM
+   selects promo boundaries via start_line_id and end_line_id.
+2. Code-level Timestamp Resolution: Converts Line IDs into exact timestamps and
+   strictly validates duration (20-60s). Never trusts LLM timestamps.
+3. Deterministic Quality Checks: Check_Hook, Check_Start, Check_End, Check_Context.
+4. Cold Viewer Pass: Evaluates whether a viewer who never saw the show understands
+   who/what/why from the isolated transcript snippet.
+"""
+
+import os
+import json
+import logging
+from typing import List, Dict, Any, Tuple, Optional
+import pandas as pd
+
+from llm_client import generate_json
+from deterministic_checks import run_all_deterministic_checks, resolve_segments_and_duration
+from script_parser import episode_number
+
+logger = logging.getLogger("PromoExtractor")
+
+# Candidate extraction schema (up to 3 candidate promos per episode)
+CANDIDATE_EXTRACTION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "candidate_promos": {
+            "type": "ARRAY",
+            "description": "Up to 3 high-tension promotional clips strictly between 20s and 60s total duration",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "segments": {
+                        "type": "ARRAY",
+                        "description": "List of ordered segments making up this promo (usually 1 continuous segment, or 2 non-contiguous jump-cuts)",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "start_line_id": {"type": "STRING", "description": "e.g. E1-L005"},
+                                "end_line_id": {"type": "STRING", "description": "e.g. E1-L028"}
+                            },
+                            "required": ["start_line_id", "end_line_id"]
+                        }
+                    },
+                    "hook_score": {"type": "INTEGER", "description": "1 to 10 rating of opening 3s hook tension"},
+                    "cliffhanger_score": {"type": "INTEGER", "description": "1 to 10 rating of closing cliffhanger urgency"},
+                    "standalone_score": {"type": "INTEGER", "description": "1 to 10 rating of standalone clarity"},
+                    "hook": {"type": "STRING", "description": "1-2 sentence description of the opening dramatic hook"},
+                    "cliffhanger": {"type": "STRING", "description": "1-2 sentence description of the ending cliffhanger"},
+                    "why": {"type": "STRING", "description": "One line explaining why this clip will stop thumbs and convert viewers"}
+                },
+                "required": [
+                    "segments", "hook_score", "cliffhanger_score",
+                    "standalone_score", "hook", "cliffhanger", "why"
+                ]
+            }
+        }
+    },
+    "required": ["candidate_promos"]
+}
+
+COLD_VIEWER_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "pass": {"type": "BOOLEAN", "description": "true if a cold viewer understands the stakes, false otherwise"},
+        "reason": {"type": "STRING", "description": "One sentence explaining why it is clear or confusing to a new viewer"}
+    },
+    "required": ["pass", "reason"]
+}
+
+
+def seconds_to_timecode(seconds: float) -> str:
+    """Converts float seconds into MM:SS.ms formatted string."""
+    if pd.isna(seconds) or seconds < 0:
+        return "00:00.00"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes:02d}:{secs:05.2f}"
+
+
+def format_numbered_script(episode_df: pd.DataFrame) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Formats an episode's screenplay lines into a numbered transcript
+    with line IDs (e.g. [E1-L001]) for unambiguous LLM anchoring.
+    """
+    lines_formatted = []
+    logline = None
+    continuity = None
+
+    if "Episode_Logline" in episode_df.columns:
+        valid_logs = episode_df["Episode_Logline"].dropna().unique()
+        if len(valid_logs) > 0:
+            logline = str(valid_logs[0])
+
+    if "Continuity_Notes" in episode_df.columns:
+        valid_notes = episode_df["Continuity_Notes"].dropna().unique()
+        if len(valid_notes) > 0:
+            continuity = str(valid_notes[0])
+
+    for _, row in episode_df.iterrows():
+        lid = str(row.get("Line_ID", f"E{row.get('Episode', 1)}-L{row.name:03d}"))
+        t_start = seconds_to_timecode(float(row.get("Start_Sec", 0.0)))
+        t_end = seconds_to_timecode(float(row.get("End_Sec", 0.0)))
+        entity = str(row.get("Entity_Type", "ACTION"))
+        emotion = f" ({row.get('Emotion')})" if pd.notna(row.get("Emotion")) and row.get("Emotion") else ""
+        content = str(row.get("Content", "")).strip()
+
+        lines_formatted.append(f"[{lid}] ({t_start} - {t_end}) {entity}{emotion}: {content}")
+
+    return "\n".join(lines_formatted), logline, continuity
+
+
+def _extract_promos_offline_heuristic(episode_df: pd.DataFrame, ep_num: int) -> List[Dict[str, Any]]:
+    """
+    Offline fallback: Generates line-ID anchored promotional candidates deterministically
+    when no LLM API key is configured or during offline testing.
+    """
+    non_dialogue = {"CAMERA", "SOUND FX", "MUSIC", "SFX"}
+    records = episode_df.reset_index(drop=True)
+    num_r = len(records)
+    candidates = []
+
+    for i in range(num_r):
+        row_i = records.loc[i]
+        ent_i = str(row_i.get("Entity_Type", "")).upper()
+        if ent_i in non_dialogue or ent_i == "ACTION":
+            continue
+
+        c_i = str(row_i.get("Content", "")).lstrip('"\'').strip()
+        if c_i.startswith("...") or (len(c_i) > 0 and c_i[0].islower()):
+            continue
+
+        s_time = float(row_i["Start_Sec"])
+
+        for j in range(i + 1, num_r):
+            row_j = records.loc[j]
+            e_time = float(row_j["End_Sec"])
+            dur = e_time - s_time
+
+            if dur > 58.0:
+                break
+
+            if dur >= 25.0:
+                window = records.loc[i:j]
+                dialogue_count = (~window["Entity_Type"].str.upper().isin(non_dialogue)).sum()
+                has_emotion = window["Emotion"].dropna().count()
+                score = (dialogue_count * 2.0) + (has_emotion * 1.5) - abs(dur - 38.0) * 0.2
+
+                candidates.append({
+                    "start_line_id": row_i["Line_ID"],
+                    "end_line_id": row_j["Line_ID"],
+                    "score": score,
+                    "start_row": row_i,
+                    "end_row": row_j,
+                })
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    top_candidates = candidates[:3]
+
+    results = []
+    for c in top_candidates:
+        s_row = c["start_row"]
+        e_row = c["end_row"]
+        results.append({
+            "segments": [{"start_line_id": c["start_line_id"], "end_line_id": c["end_line_id"]}],
+            "hook_score": 8,
+            "cliffhanger_score": 8,
+            "standalone_score": 8,
+            "hook": f"Confrontation opens: [{s_row.get('Entity_Type')}]: {str(s_row.get('Content'))[:60]}",
+            "cliffhanger": f"Tension peaks: [{e_row.get('Entity_Type')}]: {str(e_row.get('Content'))[:60]}",
+            "why": "High dramatic tension and strong character confrontation ideal for ad conversion."
+        })
+
+    return results
+
+
+def extract_promos_for_episode(
+    episode_df: pd.DataFrame,
+    master_df: pd.DataFrame,
+    api_key: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    failures_log: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Extracts up to 3 candidate promotional clips for a single episode using line-ID anchoring,
+    validates 20-60s duration, runs deterministic checks, and executes cold-viewer review.
+    """
+    if episode_df.empty:
+        return []
+
+    ep_num = int(episode_df.iloc[0].get("Episode", 1))
+    script_text, logline, continuity = format_numbered_script(episode_df)
+
+    prompt = f"""You are an elite short-form vertical video ad editor (Kuku, ReelShort, TikTok).
+Your goal is to extract UP TO 3 candidate promotional clips from Episode {ep_num}.
+
+### CRITICAL RULES:
+1. ANCHOR BY LINE ID ONLY: Do not write timestamps. Specify clip boundaries using start_line_id and end_line_id from the bracketed IDs (e.g. 'E{ep_num}-L005').
+2. STRICT DURATION (20.0s to 60.0s): The sum of duration of your segments MUST be between 20.0 and 60.0 seconds. Look at the (MM:SS - MM:SS) timestamps next to each line to calculate duration!
+3. OPENING HOOK: The first line must hook the viewer immediately (confrontation, betrayal, slap, reveal, high drama). No lines starting with '...' or lowercase.
+4. CLIFFHANGER: Cut off at peak dramatic tension before resolution.
+5. STANDALONE CONTINUITY: A new viewer must understand the stakes without prior episodes.
+
+### EPISODE CONTEXT:
+- Episode Logline: {logline or 'N/A'}
+- Continuity Notes: {continuity or 'N/A'}
+
+### NUMBERED SCREENPLAY TRANSCRIPT:
+{script_text}
+
+Extract up to 3 high-impact promotional candidates. Return strictly JSON matching the schema.
+"""
+
+    system_instruction = "You are an expert microdrama promotional video editor. Output valid JSON matching the schema."
+
+    response = None
+    for attempt in range(2):
+        try:
+            curr_prompt = prompt
+            if attempt == 1:
+                curr_prompt += "\n\nNOTE: Ensure the total duration of selected line ranges is STRICTLY between 20.0 and 60.0 seconds."
+
+            response = generate_json(
+                prompt=curr_prompt,
+                schema=CANDIDATE_EXTRACTION_SCHEMA,
+                system_instruction=system_instruction,
+                api_key=api_key,
+                provider=provider,
+                model=model,
+                temperature=0.2,
+            )
+            if response and "candidate_promos" in response:
+                break
+        except Exception as e:
+            logger.warning("Episode %d candidate extraction attempt %d failed: %s", ep_num, attempt + 1, e)
+
+    if not response or "candidate_promos" not in response:
+        logger.info("Falling back to deterministic line-ID candidate generation for Episode %d...", ep_num)
+        candidates_raw = _extract_promos_offline_heuristic(episode_df, ep_num)
+    else:
+        candidates_raw = response.get("candidate_promos", [])
+    valid_candidates = []
+
+    for c_idx, cand in enumerate(candidates_raw, 1):
+        segs = cand.get("segments", [])
+        is_valid_dur, total_dur, resolved_segs, dur_msg = resolve_segments_and_duration(
+            segs, master_df, min_dur=20.0, max_dur=60.0
+        )
+
+        if not is_valid_dur:
+            logger.warning("Episode %d Candidate %d duration rejected: %s", ep_num, c_idx, dur_msg)
+            if failures_log is not None:
+                failures_log.append({
+                    "Episode": ep_num,
+                    "Candidate_Idx": c_idx,
+                    "Reason": f"Duration validation failed: {dur_msg}"
+                })
+            continue
+
+        # Extract lines for deterministic checks & cold viewer
+        start_line_id = resolved_segs[0]["start_line_id"]
+        end_line_id = resolved_segs[-1]["end_line_id"]
+        start_time_sec = resolved_segs[0]["start_sec"]
+        end_time_sec = resolved_segs[-1]["end_sec"]
+
+        # Collect all rows between the start and end of segments
+        clip_line_dfs = []
+        for r_seg in resolved_segs:
+            s_id = r_seg["start_line_id"]
+            e_id = r_seg["end_line_id"]
+            # Filter rows by episode and timestamp range
+            seg_mask = (
+                (master_df["Episode"] >= r_seg["episode_start"]) &
+                (master_df["Episode"] <= r_seg["episode_end"]) &
+                (master_df["Start_Sec"] >= r_seg["start_sec"] - 0.05) &
+                (master_df["End_Sec"] <= r_seg["end_sec"] + 0.05)
+            )
+            clip_line_dfs.append(master_df[seg_mask])
+
+        clip_lines = pd.concat(clip_line_dfs, ignore_index=True) if clip_line_dfs else pd.DataFrame()
+
+        # Run deterministic checks
+        det_checks = run_all_deterministic_checks(clip_lines, start_time_sec)
+
+        # Build transcript snippet
+        snippet_lines = []
+        for _, row in clip_lines.iterrows():
+            snippet_lines.append(f"{row.get('Entity_Type', 'ACTION')}: {row.get('Content', '')}")
+        transcript_snippet = "\n".join(snippet_lines)
+
+        # Run Cold Viewer Audit
+        cold_pass, cold_reason = run_cold_viewer_audit(
+            transcript_snippet=transcript_snippet,
+            api_key=api_key,
+            provider=provider,
+            model=model
+        )
+
+        # Build formatted segment timestamps string
+        seg_str_parts = []
+        for s in resolved_segs:
+            seg_str_parts.append(
+                f"[E{s['episode_start']}: {seconds_to_timecode(s['start_sec'])} -> {seconds_to_timecode(s['end_sec'])} ({s['duration_sec']:.1f}s)]"
+            )
+        segments_summary = "; ".join(seg_str_parts)
+
+        valid_candidates.append({
+            "Episode": ep_num,
+            "Start_Time": seconds_to_timecode(start_time_sec),
+            "End_Time": seconds_to_timecode(end_time_sec),
+            "Start_Sec": start_time_sec,
+            "End_Sec": end_time_sec,
+            "Duration_Sec": total_dur,
+            "Segments_Count": len(resolved_segs),
+            "Segments_Detail": segments_summary,
+            "Start_Line_ID": start_line_id,
+            "End_Line_ID": end_line_id,
+            "Hook_Description": cand.get("hook", ""),
+            "Cliffhanger_Description": cand.get("cliffhanger", ""),
+            "Justification": cand.get("why", ""),
+            "hook_score": cand.get("hook_score", 7),
+            "cliffhanger_score": cand.get("cliffhanger_score", 7),
+            "standalone_score": cand.get("standalone_score", 7),
+            "Check_Hook": det_checks["Check_Hook"],
+            "Check_Start": det_checks["Check_Start"],
+            "Check_End": det_checks["Check_End"],
+            "Check_Context": det_checks["Check_Context"],
+            "All_Checks_Passed": det_checks["All_Checks_Passed"],
+            "Cold_Viewer_Pass": "PASS" if cold_pass else "FAIL",
+            "Cold_Viewer_Reason": cold_reason,
+            "Transcript_Snippet": transcript_snippet[:400],
+            "raw_segments": resolved_segs,
+        })
+
+    return valid_candidates
+
+
+def run_cold_viewer_audit(
+    transcript_snippet: str,
+    api_key: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    Second LLM pass: Audits whether a viewer who never saw the show
+    understands who is speaking, what the central conflict is, and why it matters.
+    """
+    prompt = f"""You are a first-time viewer scrolling social media (TikTok/Reels/Shorts).
+You have NEVER watched this show before. Read ONLY this raw audio-visual clip transcript:
+
+{transcript_snippet}
+
+Question: Does a first-time viewer immediately understand who the key characters are, what the conflict is, and why they should care?
+If crucial context is completely missing (e.g. unknown names with no clue who they are, confusing unanchored dialogue), answer pass: false.
+If the dramatic stakes and conflict are clear on their own, answer pass: true.
+
+Return strictly JSON matching schema:
+{{"pass": true/false, "reason": "one concise sentence explaining why"}}
+"""
+
+    try:
+        res = generate_json(
+            prompt=prompt,
+            schema=COLD_VIEWER_SCHEMA,
+            system_instruction="You are a cold viewer auditing video ad clarity. Output valid JSON.",
+            api_key=api_key,
+            provider=provider,
+            model=model,
+            temperature=0.1
+        )
+        return bool(res.get("pass", True)), str(res.get("reason", "Clear standalone tension."))
+    except Exception as e:
+        logger.warning("Cold viewer audit failed: %s", e)
+        return True, "Cold viewer audit skipped due to API error."

@@ -1,23 +1,29 @@
 """
 Kuku Microdrama Promotional Clip Extractor
 ==========================================
-Interactive Streamlit Web Dashboard for Stakeholder Presentation.
-Ranks, filters, visualizes, and exports AI-extracted promotional microdrama clips (20-60s).
-
-Deployment Target: Streamlit Community Cloud
+Interactive Streamlit Web Dashboard fulfilling Kuku FM microdrama promotional briefs:
+  - Tab 1: 🚀 Run on a New Screenplay (upload .txt files or paste text, select provider/model, in-memory API key)
+  - Tab 2: 📊 View Existing Results (inspect, filter, and export promotional campaigns)
 """
 
 import os
 import io
+import json
 import glob
+import time
 from typing import Optional, List, Dict, Any
 import pandas as pd
 import streamlit as st
 
-from script_parser import episode_number
+from script_parser import parse_screenplay, episode_number
+from promo_extractor import extract_promos_for_episode
+from cross_episode_ranker import deduplicate_overlapping_candidates, run_llm_judge_ranking
+from phase3_video_pipeline import generate_promo_srt, generate_ffmpeg_commands
+from marketing_creative_generator import generate_marketing_creatives, calculate_optimal_thumbnail_timestamp
+from llm_client import reset_run_stats, get_run_stats
 
 # ==============================================================================
-# 1. PAGE CONFIGURATION & THEME STYLING
+# PAGE CONFIGURATION & STYLING
 # ==============================================================================
 st.set_page_config(
     page_title="Kuku Microdrama Promo Extractor",
@@ -26,19 +32,18 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for polished stakeholder presentation
 st.markdown("""
 <style>
     .main-header {
         font-size: 2.2rem;
         font-weight: 800;
-        color: #E50914; /* Kuku cinematic red */
+        color: #E50914;
         margin-bottom: 0.2rem;
     }
     .sub-header {
         font-size: 1.05rem;
         color: #4A4A4A;
-        margin-bottom: 1.5rem;
+        margin-bottom: 1.2rem;
     }
     .recommendation-box {
         background-color: #FFF5F5;
@@ -47,17 +52,17 @@ st.markdown("""
         padding: 20px;
         margin-bottom: 25px;
     }
-    .badge-hook {
-        background-color: #FEEBC8;
-        color: #7B341E;
+    .badge-pass {
+        background-color: #C6F6D5;
+        color: #22543D;
         padding: 3px 8px;
         border-radius: 4px;
         font-weight: bold;
         font-size: 0.85rem;
     }
-    .badge-cliff {
-        background-color: #E2E8F0;
-        color: #2D3748;
+    .badge-fail {
+        background-color: #FED7D7;
+        color: #9B2C2C;
         padding: 3px 8px;
         border-radius: 4px;
         font-weight: bold;
@@ -68,349 +73,376 @@ st.markdown("""
 
 
 # ==============================================================================
-# 2. DATA LOADING (NO FABRICATED DATA)
+# HELPER FUNCTIONS
 # ==============================================================================
 def find_latest_manifest() -> Optional[str]:
     """Finds the most recent promotional manifest CSV on disk."""
-    # Check timestamped run directories first (output/run_*/promo_campaign_manifest.csv)
-    run_manifests = sorted(glob.glob(os.path.join("output", "run_*", "promo_campaign_manifest.csv")), reverse=True)
+    run_manifests = sorted(glob.glob(os.path.join("output", "run_*", "promos.csv")), reverse=True)
     if run_manifests:
         return run_manifests[0]
 
-    # Standard campaign manifest location
-    standard_manifest = os.path.join("output", "promo_campaign", "promo_campaign_manifest.csv")
-    if os.path.exists(standard_manifest):
-        return standard_manifest
+    campaign_csvs = [
+        os.path.join("output", "promo_campaign", "promo_campaign_manifest.csv"),
+    ]
+    for p in campaign_csvs:
+        if os.path.exists(p):
+            return p
     return None
 
 
-def load_dataset(uploaded_file) -> Optional[pd.DataFrame]:
-    """
-    Loads promotional data from an uploaded CSV or a local pipeline manifest.
-    Returns None if no data is found (empty state).
-    """
-    if uploaded_file is not None:
-        try:
-            return pd.read_csv(uploaded_file)
-        except Exception as e:
-            st.sidebar.error(f"Error reading uploaded CSV: {e}")
-            return None
+def render_promo_table(df: pd.DataFrame):
+    """Renders formatted table of promotional clips with clean headers and configs."""
+    cols_to_show = [
+        "Rank", "Episode", "Start_Time", "End_Time", "Duration_Sec",
+        "Rank_Score", "Hook_Description", "Cliffhanger_Description",
+        "Why_Post_First", "Check_Hook", "Check_Start", "Check_End", "Check_Context", "Cold_Viewer_Pass"
+    ]
+    existing_cols = [c for c in cols_to_show if c in df.columns]
 
-    manifest_path = find_latest_manifest()
-    if manifest_path and os.path.exists(manifest_path):
-        try:
-            df = pd.read_csv(manifest_path)
-            if not df.empty:
-                return df
-        except Exception:
-            return None
-
-    return None
+    st.dataframe(
+        df[existing_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Rank": st.column_config.NumberColumn(format="#%d"),
+            "Duration_Sec": st.column_config.NumberColumn(format="%.1f s"),
+            "Rank_Score": st.column_config.NumberColumn(format="%.1f pts"),
+        }
+    )
 
 
 # ==============================================================================
-# 3. DATA NORMALIZATION & ORDERING
-# ==============================================================================
-def normalize_and_order_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalizes column aliases, ensures numeric episode representation,
-    and applies sorting (by Rank/Rank_Score if present, else preserves file order).
-    """
-    data = df.copy()
-
-    col_mapping = {
-        "Start_Timecode": "Start_Time",
-        "Raw_Start_Time": "Start_Time",
-        "End_Timecode": "End_Time",
-        "Raw_End_Time": "End_Time",
-        "Hook": "Hook_Description",
-        "Cliffhanger": "Cliffhanger_Description"
-    }
-    for old_col, new_col in col_mapping.items():
-        if old_col in data.columns and new_col not in data.columns:
-            data[new_col] = data[old_col]
-
-    # Normalize Episode as integer
-    if "Episode" in data.columns:
-        data["Episode"] = data["Episode"].apply(episode_number).astype(int)
-    else:
-        data["Episode"] = 1
-
-    # Ensure Duration_Sec is numeric
-    if "Duration_Sec" in data.columns:
-        data["Duration_Sec"] = pd.to_numeric(data["Duration_Sec"], errors="coerce").fillna(30.0)
-    elif "Snapped_Duration_Sec" in data.columns:
-        data["Duration_Sec"] = pd.to_numeric(data["Snapped_Duration_Sec"], errors="coerce").fillna(30.0)
-    else:
-        data["Duration_Sec"] = 30.0
-
-    # Ensure required textual columns exist
-    for col in ["Start_Time", "End_Time", "Hook_Description", "Cliffhanger_Description", "Justification"]:
-        if col not in data.columns:
-            data[col] = "N/A"
-
-    # Sorting order logic:
-    # If Rank_Score or Rank is present, sort by it; otherwise maintain natural file order.
-    if "Rank_Score" in data.columns:
-        data["Rank_Score"] = pd.to_numeric(data["Rank_Score"], errors="coerce").fillna(0.0)
-        data = data.sort_values(by="Rank_Score", ascending=False).reset_index(drop=True)
-    elif "Rank" in data.columns:
-        data["Rank"] = pd.to_numeric(data["Rank"], errors="coerce").fillna(999)
-        data = data.sort_values(by="Rank", ascending=True).reset_index(drop=True)
-    else:
-        data = data.reset_index(drop=True)
-
-    return data
-
-
-# ==============================================================================
-# 4. APPLICATION HEADER & CONTEXT
+# HEADER
 # ==============================================================================
 st.markdown('<div class="main-header">🎬 Kuku Microdrama Promo Extractor</div>', unsafe_allow_html=True)
 st.markdown(
     '<div class="sub-header">'
-    'AI-powered promotional clip extraction pipeline for vertical microdrama screenplays. '
-    'Deterministically identifies <b>20 to 60-second standalone promotional hooks</b> '
-    'optimized for TikTok, Meta Reels, and YouTube Shorts.'
+    'Extract, validate, rank, and package high-converting promotional microdrama clips (20-60s) '
+    'using Line-ID anchoring and deterministic quality checks.'
     '</div>',
     unsafe_allow_html=True
 )
 
-with st.expander("ℹ️ How the Extraction Pipeline Operates", expanded=False):
-    st.markdown("""
-    1. **Deterministic Script Parsing:** Raw screenplay text files are parsed into a structured Pandas DataFrame with millisecond timestamps and character emotion tags.
-    2. **AI-Driven Promo Reasoning:** An LLM evaluates dramatic tension across each episode to isolate the single highest-converting promotional clip.
-    3. **Microdrama Structural Constraints:**
-       - **Strict Duration:** Clips are strictly constrained between **20.0 and 60.0 seconds**.
-       - **Opening Hook:** Must open on dialogue with high tension, a reveal, confrontation, or slap (no continuation fragments like `...`).
-       - **Ending Cliffhanger:** Cuts off at peak tension, maximizing viewer conversion.
-       - **Standalone Continuity:** Requires zero prior context to understand the stakes.
-    4. **Subtitles & Video Export:** Automatically generates synchronized `.srt` subtitle files and frame-accurate FFmpeg slicing scripts.
-    """)
+tab_run, tab_view = st.tabs(["🚀 Run on a New Screenplay", "📊 View Existing Results"])
+
+# ==============================================================================
+# TAB 1: RUN ON A NEW SCREENPLAY
+# ==============================================================================
+with tab_run:
+    st.subheader("Ingest New Screenplay & Extract Promos")
+    st.markdown("Upload one or more `.txt` screenplay files in Kuku format or paste the raw script below.")
+
+    col_input1, col_input2 = st.columns([1, 1])
+
+    with col_input1:
+        uploaded_scripts = st.file_uploader(
+            "Upload Screenplay .txt Files:",
+            type=["txt"],
+            accept_multiple_files=True,
+            help="Upload raw screenplay text files conforming to Kuku format."
+        )
+
+    with col_input2:
+        pasted_text = st.text_area(
+            "Or Paste Screenplay Script Text:",
+            height=140,
+            placeholder="EPISODE NUMBER: Episode 1\nEPISODE LOGLINE: ...\nCONTINUITY NOTES: ...\n--- SCRIPT START ---\nSCENE 01..."
+        )
+
+    st.markdown("---")
+    st.subheader("⚙️ Model & Provider Configuration")
+
+    col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+
+    with col_cfg1:
+        provider_choice = st.selectbox(
+            "LLM Provider:",
+            options=["gemini", "openai-compatible"],
+            index=0,
+            help="Select Google Gemini or any OpenAI-compatible endpoint (Ollama, Groq, vLLM, OpenAI)."
+        )
+
+    with col_cfg2:
+        if provider_choice == "gemini":
+            model_name = st.selectbox(
+                "Model:",
+                options=["gemini-3.5-flash-lite", "gemini-3.5-flash"],
+                index=0
+            )
+            base_url = None
+        else:
+            model_name = st.text_input("Model Name:", value="gpt-4o-mini")
+            base_url = st.text_input("Base URL (optional):", value="https://api.openai.com/v1")
+
+    with col_cfg3:
+        # User API Key is stored in st.session_state ONLY; NEVER in os.environ
+        if "user_api_key" not in st.session_state:
+            st.session_state["user_api_key"] = ""
+
+        api_key_input = st.text_input(
+            "API Key (kept in session memory only):",
+            type="password",
+            value=st.session_state.get("user_api_key", ""),
+            help="Your API key stays strictly in browser session memory and is never written to disk or environment."
+        )
+        if api_key_input:
+            st.session_state["user_api_key"] = api_key_input
+
+    btn_run = st.button("🚀 Extract & Rank Promos", type="primary", use_container_width=True)
+
+    if btn_run:
+        # Input validation
+        has_files = uploaded_scripts is not None and len(uploaded_scripts) > 0
+        has_text = pasted_text is not None and len(pasted_text.strip()) > 30
+
+        if not has_files and not has_text:
+            st.error("⚠️ Please upload at least one .txt screenplay file or paste script text above.")
+        else:
+            active_key = st.session_state.get("user_api_key", "").strip()
+            # Fallback to env if session key empty
+            if not active_key:
+                active_key = os.getenv("GEMINI_API_KEY", "") or os.getenv("LLM_API_KEY", "")
+
+            if not active_key:
+                st.error("⚠️ Please provide an API key for the selected provider to run the extraction.")
+            else:
+                try:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+
+                    # Step 1: Parse input scripts
+                    status_text.info("📖 Step 1/5: Parsing screenplay lines into structured master dataset...")
+                    all_dfs = []
+
+                    if has_files:
+                        for uf in uploaded_scripts:
+                            text_content = uf.read().decode("utf-8", errors="replace")
+                            df_parsed = parse_screenplay(text_content, include_extended_metadata=True)
+                            if not df_parsed.empty:
+                                all_dfs.append(df_parsed)
+
+                    if has_text:
+                        df_pasted = parse_screenplay(pasted_text, include_extended_metadata=True)
+                        if not df_pasted.empty:
+                            all_dfs.append(df_pasted)
+
+                    if not all_dfs:
+                        st.error("Failed to parse any valid screenplay lines. Please check script formatting.")
+                        st.stop()
+
+                    master_df = pd.concat(all_dfs, ignore_index=True)
+                    master_df["Episode"] = master_df["Episode"].apply(episode_number).astype(int)
+                    progress_bar.progress(25)
+
+                    # Step 2: Extract line-ID anchored candidates
+                    episodes_found = sorted(list(master_df["Episode"].unique()))
+                    status_text.info(f"🎯 Step 2/5: Extracting candidate promos across {len(episodes_found)} episodes (Line-ID anchored)...")
+
+                    raw_candidates = []
+                    for idx, ep_id in enumerate(episodes_found):
+                        ep_df = master_df[master_df["Episode"] == ep_id].copy().reset_index(drop=True)
+                        candidates = extract_promos_for_episode(
+                            episode_df=ep_df,
+                            master_df=master_df,
+                            api_key=active_key,
+                            provider=provider_choice,
+                            model=model_name
+                        )
+                        raw_candidates.extend(candidates)
+
+                    progress_bar.progress(60)
+
+                    # Step 3: Deduplicate overlapping picks (>30%)
+                    status_text.info(f"⚡ Step 3/5: Deduplicating overlapping clips across {len(raw_candidates)} candidates...")
+                    deduped = deduplicate_overlapping_candidates(raw_candidates, overlap_threshold=0.30)
+                    progress_bar.progress(75)
+
+                    # Step 4: Run cross-episode ranking & judge evaluation
+                    status_text.info("🏆 Step 4/5: Running Cross-Episode LLM Judge & Deterministic Rule Penalization...")
+                    ranked_results = run_llm_judge_ranking(
+                        candidates=deduped,
+                        api_key=active_key,
+                        provider=provider_choice,
+                        model=model_name
+                    )
+                    progress_bar.progress(90)
+
+                    # Step 5: Packaging & creatives
+                    status_text.info("✨ Step 5/5: Generating on-screen hook overlays and social copy...")
+                    for r in ranked_results:
+                        creatives = generate_marketing_creatives(
+                            episode_id=r.get("Episode", 1),
+                            hook_desc=r.get("Hook_Description", ""),
+                            cliffhanger_desc=r.get("Cliffhanger_Description", ""),
+                            transcript_text=r.get("Transcript_Snippet", ""),
+                            model_name=model_name,
+                            api_key=active_key,
+                            provider=provider_choice
+                        )
+                        h_opts = creatives.get("on_screen_hook_options", [])
+                        r["On_Screen_Hook_1"] = h_opts[0] if len(h_opts) > 0 else "Must-Watch Betrayal"
+                        r["Social_Caption"] = creatives.get("social_caption", "")
+
+                    progress_bar.progress(100)
+                    status_text.success("✅ Promotional Clip Extraction & Ranking Complete!")
+
+                    results_df = pd.DataFrame(ranked_results).drop(columns=["raw_segments"], errors="ignore")
+                    st.session_state["latest_results_df"] = results_df
+
+                except Exception as e:
+                    st.error(f"❌ An error occurred during pipeline execution: {str(e)}")
+
+    # Display results if present in session state
+    if "latest_results_df" in st.session_state and not st.session_state["latest_results_df"].empty:
+        res_df = st.session_state["latest_results_df"]
+        st.markdown("---")
+        st.subheader("📋 Extraction Results & Campaign Manifest")
+
+        # Top Recommendation Highlight Card
+        top_clip = res_df.iloc[0]
+        st.markdown('<div class="recommendation-box">', unsafe_allow_html=True)
+        st.subheader(f"🏆 #1 Top Ranked Promo: Episode {top_clip['Episode']}")
+        c_meta, c_info = st.columns([1, 2])
+        with c_meta:
+            st.markdown(f"**Exact Timeframe:** `{top_clip['Start_Time']}` $\\rightarrow$ `{top_clip['End_Time']}`")
+            st.markdown(f"**Duration:** `{top_clip['Duration_Sec']:.1f}s`")
+            st.markdown(f"**Rank Score:** :green[**{top_clip.get('Rank_Score', 0):.1f} / 100**]")
+            if "On_Screen_Hook_1" in top_clip:
+                st.markdown(f"**On-Screen Hook:**\n> *\"{top_clip['On_Screen_Hook_1']}\"*")
+        with c_info:
+            st.markdown(f"**🪝 Opening Hook:** {top_clip.get('Hook_Description')}")
+            st.markdown(f"**⚡ Cliffhanger Ending:** {top_clip.get('Cliffhanger_Description')}")
+            st.info(f"💡 **Why Post This First:** {top_clip.get('Why_Post_First', top_clip.get('Justification'))}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        render_promo_table(res_df)
+
+        # Export buttons
+        st.markdown("#### 📥 Export Formatted Campaign Manifest")
+        d_col1, d_col2 = st.columns(2)
+        with d_col1:
+            csv_buf = io.StringIO()
+            res_df.to_csv(csv_buf, index=False)
+            st.download_button(
+                "📥 Download Manifest (.CSV)",
+                data=csv_buf.getvalue().encode("utf-8"),
+                file_name="kuku_promos_manifest.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        with d_col2:
+            json_str = res_df.to_json(orient="records", indent=2)
+            st.download_button(
+                "📥 Download Manifest (.JSON)",
+                data=json_str.encode("utf-8"),
+                file_name="kuku_promos_manifest.json",
+                mime="application/json",
+                use_container_width=True
+            )
 
 
 # ==============================================================================
-# 5. SIDEBAR: DATA LOADING, API KEY & FILTER CONTROLS
+# TAB 2: VIEW EXISTING RESULTS
 # ==============================================================================
-st.sidebar.header("🔑 API Configuration")
+with tab_view:
+    st.subheader("Explore Existing Promotional Manifest")
 
-default_secret_key = ""
-try:
-    if "GEMINI_API_KEY" in st.secrets:
-        default_secret_key = st.secrets["GEMINI_API_KEY"]
-except Exception:
-    pass
-
-if not default_secret_key:
-    default_secret_key = os.getenv("GEMINI_API_KEY", "")
-
-gemini_key_input = st.sidebar.text_input(
-    "Google Gemini API Key:",
-    value=default_secret_key if default_secret_key else "",
-    type="password",
-    help="Add your API key here or configure it in Streamlit Cloud Settings > Secrets."
-)
-
-if gemini_key_input:
-    os.environ["GEMINI_API_KEY"] = gemini_key_input
-    st.sidebar.success("✅ Gemini API Key Active")
-
-st.sidebar.markdown("---")
-st.sidebar.header("📁 Data Source & Filters")
-
-uploaded_file = st.sidebar.file_uploader(
-    "Upload Extracted Promos Manifest (CSV)",
-    type=["csv"],
-    help="Upload promo_campaign_manifest.csv or any promotional clips CSV."
-)
-
-raw_df = load_dataset(uploaded_file)
-
-# If no dataset exists, display empty state and stop execution
-if raw_df is None or raw_df.empty:
-    st.info(
-        "👋 **No promotional clips manifest found.**\n\n"
-        "To get started:\n"
-        "1. Run the pipeline in your terminal: `python run_pipeline.py`\n"
-        "2. Or upload a manifest CSV using the sidebar on the left."
+    existing_file = st.sidebar.file_uploader(
+        "Upload Extracted Manifest (CSV / JSON):",
+        type=["csv", "json"],
+        help="Upload an existing promos.csv or promos.json file"
     )
-    st.stop()
 
-# Normalize and format dataset
-df_normalized = normalize_and_order_data(raw_df)
+    loaded_df = None
+    if existing_file is not None:
+        try:
+            if existing_file.name.endswith(".json"):
+                loaded_df = pd.read_json(existing_file)
+            else:
+                loaded_df = pd.read_csv(existing_file)
+        except Exception as e:
+            st.error(f"Error reading uploaded file: {e}")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 Refine Clips")
+    if loaded_df is None or loaded_df.empty:
+        latest_path = find_latest_manifest()
+        if latest_path and os.path.exists(latest_path):
+            try:
+                loaded_df = pd.read_csv(latest_path)
+            except Exception:
+                loaded_df = None
 
-# Filter 1: Episode Selector (guaranteed integer sorting, never raises TypeError)
-available_episodes = sorted(list(df_normalized["Episode"].unique()))
-selected_episodes = st.sidebar.multiselect(
-    "Filter by Episode Number:",
-    options=available_episodes,
-    default=available_episodes
-)
-
-# Filter 2: Duration Slider (Strict 20-60s)
-min_dur_slider, max_dur_slider = st.sidebar.slider(
-    "Clip Duration Range (Seconds):",
-    min_value=20.0,
-    max_value=60.0,
-    value=(20.0, 60.0),
-    step=0.5,
-    help="Filter clips strictly within microdrama duration constraints."
-)
-
-# Filter 3: Minimum Score Slider (defaults to 0 so no rows are hidden by default)
-if "Rank_Score" in df_normalized.columns:
-    max_rank_val = float(df_normalized["Rank_Score"].max() or 100.0)
-    min_score = st.sidebar.slider(
-        "Minimum Rank Score:",
-        min_value=0.0,
-        max_value=max_rank_val,
-        value=0.0,
-        step=1.0,
-        help="Defaults to 0 so all rows remain visible."
-    )
-    score_mask = df_normalized["Rank_Score"] >= min_score
-else:
-    score_mask = True
-
-# Apply filters
-filtered_df = df_normalized[
-    (df_normalized["Episode"].isin(selected_episodes)) &
-    (df_normalized["Duration_Sec"] >= min_dur_slider) &
-    (df_normalized["Duration_Sec"] <= max_dur_slider) &
-    score_mask
-].copy()
-
-
-# ==============================================================================
-# 6. EXECUTIVE KPI METRICS
-# ==============================================================================
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-
-with kpi1:
-    st.metric("Total Extracted Clips", f"{len(filtered_df)}")
-
-with kpi2:
-    avg_dur = filtered_df["Duration_Sec"].mean() if not filtered_df.empty else 0.0
-    st.metric("Avg Clip Duration", f"{avg_dur:.1f} sec")
-
-with kpi3:
-    top_ep = filtered_df.iloc[0]["Episode"] if not filtered_df.empty else "N/A"
-    st.metric("Top Recommended Episode", f"Episode {top_ep}")
-
-with kpi4:
-    if "Rank_Score" in filtered_df.columns:
-        top_score_val = f"{filtered_df['Rank_Score'].max():.1f}"
-        st.metric("Top Rank Score", top_score_val)
+    if loaded_df is None or loaded_df.empty:
+        st.info(
+            "👋 **No existing promotional manifest found.**\n\n"
+            "Run the pipeline on a new screenplay in Tab 1, or execute `python run_pipeline.py` in your terminal."
+        )
     else:
-        st.metric("Pipeline Status", "Completed")
+        # Filters in sidebar
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🎯 Filter Promos")
 
-st.markdown("<br>", unsafe_allow_html=True)
+        if "Episode" in loaded_df.columns:
+            loaded_df["Episode"] = loaded_df["Episode"].apply(episode_number).astype(int)
+            available_eps = sorted(list(loaded_df["Episode"].unique()))
+            sel_eps = st.sidebar.multiselect("Filter by Episode:", options=available_eps, default=available_eps)
+        else:
+            sel_eps = []
 
+        dur_slider = st.sidebar.slider(
+            "Duration Filter (s):",
+            min_value=20.0,
+            max_value=60.0,
+            value=(20.0, 60.0),
+            step=0.5
+        )
 
-# ==============================================================================
-# 7. DEDICATED SECTION: TOP RECOMMENDATION (#1 RANKED PROMO)
-# ==============================================================================
-if not filtered_df.empty:
-    top_clip = filtered_df.iloc[0]
+        min_score = 0.0
+        if "Rank_Score" in loaded_df.columns:
+            min_score = st.sidebar.slider(
+                "Minimum Rank Score:",
+                min_value=0.0,
+                max_value=float(loaded_df["Rank_Score"].max() or 100.0),
+                value=0.0,
+                step=1.0
+            )
 
-    st.markdown('<div class="recommendation-box">', unsafe_allow_html=True)
-    st.subheader(f"🏆 Top Recommendation: Episode {top_clip['Episode']} Promotional Clip")
-    
-    col_rec_meta, col_rec_just = st.columns([1, 2])
+        # Apply filtering
+        filt_df = loaded_df.copy()
+        if sel_eps and "Episode" in filt_df.columns:
+            filt_df = filt_df[filt_df["Episode"].isin(sel_eps)]
+        if "Duration_Sec" in filt_df.columns:
+            filt_df = filt_df[(filt_df["Duration_Sec"] >= dur_slider[0]) & (filt_df["Duration_Sec"] <= dur_slider[1])]
+        if "Rank_Score" in filt_df.columns:
+            filt_df = filt_df[filt_df["Rank_Score"] >= min_score]
 
-    with col_rec_meta:
-        st.markdown(f"**Exact Timeframe:** `{top_clip['Start_Time']}` to `{top_clip['End_Time']}`")
-        st.markdown(f"**Duration:** `{top_clip['Duration_Sec']:.1f} seconds`")
-        if "Rank_Score" in top_clip and pd.notna(top_clip["Rank_Score"]):
-            st.markdown(f"**Rank Score:** :green[**{top_clip['Rank_Score']}**]")
-        if "On_Screen_Hook_1" in top_clip and pd.notna(top_clip["On_Screen_Hook_1"]):
-            st.markdown(f"**Suggested On-Screen Hook:**\n> *\"{top_clip['On_Screen_Hook_1']}\"*")
+        # KPI Metrics
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Promos", f"{len(filt_df)}")
+        avg_d = filt_df["Duration_Sec"].mean() if ("Duration_Sec" in filt_df.columns and not filt_df.empty) else 0.0
+        m2.metric("Avg Duration", f"{avg_d:.1f}s")
+        top_s = filt_df["Rank_Score"].max() if ("Rank_Score" in filt_df.columns and not filt_df.empty) else 0.0
+        m3.metric("Top Rank Score", f"{top_s:.1f}")
+        pass_rate = 0.0
+        if "All_Checks_Passed" in filt_df.columns and not filt_df.empty:
+            pass_rate = (filt_df["All_Checks_Passed"] == True).sum() / len(filt_df) * 100.0
+        m4.metric("Rule Pass Rate", f"{pass_rate:.0f}%")
 
-    with col_rec_just:
-        st.markdown(f"**🪝 Opening Hook (First 3 Seconds):**\n<span class='badge-hook'>HOOK</span> {top_clip['Hook_Description']}", unsafe_allow_html=True)
-        st.markdown(f"**⚡ Cliffhanger Ending:**\n<span class='badge-cliff'>CLIFFHANGER</span> {top_clip['Cliffhanger_Description']}", unsafe_allow_html=True)
-        st.info(f"💡 **Why Post This First:** {top_clip['Justification']}")
+        if not filt_df.empty:
+            top_rec = filt_df.iloc[0]
+            st.markdown('<div class="recommendation-box">', unsafe_allow_html=True)
+            st.subheader(f"🏆 Top Recommendation: Episode {top_rec.get('Episode', 1)}")
+            st.markdown(f"**Why Post This First:** {top_rec.get('Why_Post_First', top_rec.get('Justification', 'N/A'))}")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('</div>', unsafe_allow_html=True)
-else:
-    st.warning("⚠️ No promotional clips match your current filter settings. Adjust the sidebar filters to view clips.")
+            render_promo_table(filt_df)
 
-
-# ==============================================================================
-# 8. DATA VISUALIZATION TABLE & DETAILED EXPANDERS
-# ==============================================================================
-st.subheader("📋 Promotional Clips Catalog")
-
-base_columns = [
-    "Episode",
-    "Start_Time",
-    "End_Time",
-    "Duration_Sec",
-    "Hook_Description",
-    "Cliffhanger_Description",
-    "Justification"
-]
-if "Rank_Score" in filtered_df.columns:
-    display_columns = ["Episode", "Start_Time", "End_Time", "Duration_Sec", "Rank_Score", "Hook_Description", "Cliffhanger_Description", "Justification"]
-else:
-    display_columns = base_columns
-
-column_headers = {
-    "Episode": "Episode",
-    "Start_Time": "Start Time",
-    "End_Time": "End Time",
-    "Duration_Sec": "Duration (s)",
-    "Rank_Score": "Rank Score",
-    "Hook_Description": "Hook Event",
-    "Cliffhanger_Description": "Cliffhanger Event",
-    "Justification": "Standalone Justification"
-}
-
-st.dataframe(
-    filtered_df[display_columns].rename(columns=column_headers),
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Duration (s)": st.column_config.NumberColumn(format="%.1f s"),
-    }
-)
-
-# Expandable cards for creative details
-st.markdown("#### 🔍 Clip Detail Inspector & Social Copy")
-for idx, row in filtered_df.iterrows():
-    with st.expander(f"Episode {row['Episode']} — {row['Duration_Sec']:.1f}s Clip"):
-        d1, d2 = st.columns(2)
-        with d1:
-            st.markdown(f"**Timecodes:** `{row['Start_Time']}` $\\rightarrow$ `{row['End_Time']}`")
-            st.markdown(f"**Hook:** {row['Hook_Description']}")
-            st.markdown(f"**Cliffhanger:** {row['Cliffhanger_Description']}")
-        with d2:
-            st.markdown(f"**Standalone Justification:**\n{row['Justification']}")
-            if "Social_Caption" in row and pd.notna(row["Social_Caption"]):
-                st.text_area("Suggested Social Caption:", value=str(row["Social_Caption"]), height=80, key=f"caption_{idx}")
-
-
-# ==============================================================================
-# 9. EXPORT & DOWNLOAD FUNCTIONALITY
-# ==============================================================================
-st.markdown("---")
-c_down1, c_down2 = st.columns([3, 1])
-
-with c_down1:
-    st.markdown("**Ready to deliver to video editors and media buyers?** Download the filtered manifest.")
-
-with c_down2:
-    csv_buffer = io.StringIO()
-    filtered_df.to_csv(csv_buffer, index=False)
-    csv_bytes = csv_buffer.getvalue().encode("utf-8")
-
-    st.download_button(
-        label="📥 Download Manifest (.CSV)",
-        data=csv_bytes,
-        file_name="kuku_promotional_clips_manifest.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
+            csv_dl = io.StringIO()
+            filt_df.to_csv(csv_dl, index=False)
+            st.download_button(
+                "📥 Download Filtered Manifest (.CSV)",
+                data=csv_dl.getvalue().encode("utf-8"),
+                file_name="filtered_promos_manifest.csv",
+                mime="text/csv"
+            )
+        else:
+            st.warning("No clips match the selected filter criteria.")
