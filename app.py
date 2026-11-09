@@ -126,9 +126,51 @@ def render_promo_table(df: pd.DataFrame):
                 "Rank_Score": st.column_config.NumberColumn(format="%.1f pts"),
             }
         )
-    except Exception:
-        # Graceful fallback if pyarrow encounters any environment issues
-        st.table(df[existing_cols])
+    except BaseException:
+        # Bulletproof HTML fallback that completely bypasses pyarrow
+        table_html = df[existing_cols].to_html(
+            index=False,
+            classes="promo-dataframe-table",
+            border=0,
+            escape=True
+        )
+        st.markdown(
+            f"""
+            <style>
+                .promo-dataframe-table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    font-size: 0.88rem;
+                    margin-bottom: 25px;
+                    border: 1px solid #4A5568;
+                }}
+                .promo-dataframe-table th {{
+                    background-color: #2D3748;
+                    color: #FFFFFF;
+                    padding: 8px 10px;
+                    text-align: left;
+                    font-weight: 600;
+                    border: 1px solid #4A5568;
+                }}
+                .promo-dataframe-table td {{
+                    padding: 8px 10px;
+                    border: 1px solid #2D3748;
+                    color: #CBD5E0;
+                    vertical-align: top;
+                }}
+                .promo-dataframe-table tr:nth-child(even) {{
+                    background-color: #1A202C;
+                }}
+                .promo-dataframe-table tr:hover {{
+                    background-color: #2D3748;
+                }}
+            </style>
+            <div style="overflow-x: auto; max-width: 100%; margin-bottom: 20px;">
+                {table_html}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
 
 # ==============================================================================
