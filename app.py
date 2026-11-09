@@ -115,16 +115,20 @@ def render_promo_table(df: pd.DataFrame):
     ]
     existing_cols = [c for c in cols_to_show if c in df.columns]
 
-    st.dataframe(
-        df[existing_cols],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Rank": st.column_config.NumberColumn(format="#%d"),
-            "Duration_Sec": st.column_config.NumberColumn(format="%.1f s"),
-            "Rank_Score": st.column_config.NumberColumn(format="%.1f pts"),
-        }
-    )
+    try:
+        st.dataframe(
+            df[existing_cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Rank": st.column_config.NumberColumn(format="#%d"),
+                "Duration_Sec": st.column_config.NumberColumn(format="%.1f s"),
+                "Rank_Score": st.column_config.NumberColumn(format="%.1f pts"),
+            }
+        )
+    except Exception:
+        # Graceful fallback if pyarrow encounters any environment issues
+        st.table(df[existing_cols])
 
 
 # ==============================================================================
@@ -181,6 +185,10 @@ if uploaded_manifest_file is not None:
             loaded_df = pd.read_csv(uploaded_manifest_file)
     except Exception as e:
         st.sidebar.error(f"Error reading uploaded file: {e}")
+
+if loaded_df is None or loaded_df.empty:
+    if "dashboard_df" in st.session_state and st.session_state["dashboard_df"] is not None and not st.session_state["dashboard_df"].empty:
+        loaded_df = st.session_state["dashboard_df"]
 
 if loaded_df is None or loaded_df.empty:
     latest_path = find_latest_manifest()
@@ -441,6 +449,7 @@ with tab_run:
                     status_text.info(f"🎯 Step 2/5: Extracting candidate promos across {len(episodes_found)} episodes (Line-ID anchored)...")
 
                     raw_candidates = []
+                    failures_log = []
                     for idx, ep_id in enumerate(episodes_found):
                         ep_df = master_df[master_df["Episode"] == ep_id].copy().reset_index(drop=True)
                         candidates = extract_promos_for_episode(
@@ -448,7 +457,9 @@ with tab_run:
                             master_df=master_df,
                             api_key=active_key,
                             provider=provider_choice,
-                            model=model_name
+                            model=model_name,
+                            allow_offline=True,
+                            failures_log=failures_log
                         )
                         raw_candidates.extend(candidates)
 
@@ -465,7 +476,8 @@ with tab_run:
                         candidates=deduped,
                         api_key=active_key,
                         provider=provider_choice,
-                        model=model_name
+                        model=model_name,
+                        allow_offline=True
                     )
                     progress_bar.progress(90)
 
@@ -486,19 +498,24 @@ with tab_run:
                         r["Social_Caption"] = creatives.get("social_caption", "")
 
                     progress_bar.progress(100)
-                    status_text.success("✅ Promotional Clip Extraction & Ranking Complete!")
+                    if ranked_results:
+                        status_text.success(f"✅ Promotional Clip Extraction & Ranking Complete! ({len(ranked_results)} candidate clips generated)")
+                    else:
+                        status_text.warning("⚠️ Extraction completed, but no candidates met the duration criteria.")
 
                     results_df = pd.DataFrame(ranked_results).drop(columns=["raw_segments", "Transcript_Snippet"], errors="ignore")
                     st.session_state["latest_results_df"] = results_df
+                    st.session_state["dashboard_df"] = results_df
 
                 except Exception as e:
                     st.error(f"❌ An error occurred during pipeline execution: {str(e)}")
 
     # Display results if present in session state
-    if "latest_results_df" in st.session_state and not st.session_state["latest_results_df"].empty:
+    if "latest_results_df" in st.session_state:
         res_df = st.session_state["latest_results_df"]
-        st.markdown("---")
-        st.subheader("📋 Extraction Results & Campaign Manifest")
+        if res_df is not None and not res_df.empty:
+            st.markdown("---")
+            st.subheader("📋 Extraction Results & Campaign Manifest")
 
         top_clip = res_df.iloc[0]
         st.markdown('<div class="recommendation-box">', unsafe_allow_html=True)
@@ -541,3 +558,5 @@ with tab_run:
                 mime="application/json",
                 use_container_width=True
             )
+        else:
+            st.warning("⚠️ No candidate clips matched the strict 20.0s–60.0s duration window for the provided script.")

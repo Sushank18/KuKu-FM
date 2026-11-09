@@ -80,6 +80,72 @@ def seconds_to_timecode(seconds: float) -> str:
     return f"{minutes:02d}:{secs:05.2f}"
 
 
+def adjust_segments_to_duration(
+    segments: List[Dict[str, str]],
+    master_df: pd.DataFrame,
+    min_dur: float = 20.0,
+    max_dur: float = 60.0
+) -> List[Dict[str, str]]:
+    """
+    Intelligently adjusts line boundaries forward or backward if an LLM candidate's
+    selected line range is slightly under min_dur or over max_dur.
+    """
+    if not segments or "Line_ID" not in master_df.columns:
+        return segments
+
+    line_ids = list(master_df["Line_ID"])
+    line_map = master_df.set_index("Line_ID")
+
+    adjusted = [dict(s) for s in segments]
+    last_seg = adjusted[-1]
+    start_id = str(last_seg.get("start_line_id", "")).strip()
+    end_id = str(last_seg.get("end_line_id", "")).strip()
+
+    if start_id not in line_map.index or end_id not in line_map.index:
+        return segments
+
+    try:
+        start_idx = line_ids.index(start_id)
+        end_idx = line_ids.index(end_id)
+    except ValueError:
+        return segments
+
+    is_valid, cur_dur, _, _ = resolve_segments_and_duration(adjusted, master_df, min_dur, max_dur)
+    if is_valid:
+        return adjusted
+
+    # If too short: expand end_id forward line by line (staying within same episode)
+    if cur_dur < min_dur:
+        start_ep_row = line_map.loc[start_id]
+        if isinstance(start_ep_row, pd.DataFrame):
+            start_ep_row = start_ep_row.iloc[0]
+        ep_val = int(start_ep_row["Episode"])
+
+        while cur_dur < min_dur and end_idx + 1 < len(line_ids):
+            next_line_id = line_ids[end_idx + 1]
+            next_row = line_map.loc[next_line_id]
+            if isinstance(next_row, pd.DataFrame):
+                next_row = next_row.iloc[0]
+            if int(next_row["Episode"]) != ep_val:
+                break
+            end_idx += 1
+            last_seg["end_line_id"] = next_line_id
+            _, cur_dur, _, _ = resolve_segments_and_duration(adjusted, master_df, 0.0, 999.0)
+            if cur_dur > max_dur:
+                end_idx -= 1
+                last_seg["end_line_id"] = line_ids[end_idx]
+                break
+
+    # If too long: contract end_id backward line by line
+    elif cur_dur > max_dur:
+        while cur_dur > max_dur and end_idx > start_idx + 1:
+            end_idx -= 1
+            last_seg["end_line_id"] = line_ids[end_idx]
+            _, cur_dur, _, _ = resolve_segments_and_duration(adjusted, master_df, 0.0, 999.0)
+
+    return adjusted
+
+
 def format_numbered_script(episode_df: pd.DataFrame) -> Tuple[str, Optional[str], Optional[str]]:
     """
     Formats an episode's screenplay lines into a numbered transcript
@@ -218,11 +284,13 @@ Extract up to 3 high-impact promotional candidates. Return strictly JSON matchin
 
     response = None
     last_err = None
+    last_dur_feedback = ""
+
     for attempt in range(2):
         try:
             curr_prompt = prompt
-            if attempt == 1:
-                curr_prompt += "\n\nNOTE: Ensure the total duration of selected line ranges is STRICTLY between 20.0 and 60.0 seconds."
+            if attempt == 1 and last_dur_feedback:
+                curr_prompt += f"\n\n### CRITICAL DURATION RETRY ERROR:\n{last_dur_feedback}\nYou MUST adjust start_line_id and end_line_id so the total duration is strictly between 20.0 and 60.0 seconds!"
 
             response = generate_json(
                 prompt=curr_prompt,
@@ -234,15 +302,45 @@ Extract up to 3 high-impact promotional candidates. Return strictly JSON matchin
                 temperature=0.2,
             )
             if response and "candidate_promos" in response:
-                break
+                cands_test = response.get("candidate_promos", [])
+                has_valid = False
+                dur_errs = []
+                for c_idx, cand in enumerate(cands_test, 1):
+                    raw_s = cand.get("segments", [])
+                    adj_s = adjust_segments_to_duration(raw_s, master_df)
+                    is_ok, dur_val, _, msg = resolve_segments_and_duration(adj_s, master_df)
+                    if is_ok:
+                        has_valid = True
+                        cand["segments"] = adj_s
+                    else:
+                        dur_errs.append(f"Candidate {c_idx} was {dur_val:.1f}s ({msg})")
+
+                if has_valid:
+                    break
+                else:
+                    last_dur_feedback = "Your candidate clips were outside 20-60s: " + "; ".join(dur_errs)
+                    logger.warning("Episode %d attempt %d: all candidates violated duration: %s", ep_num, attempt + 1, last_dur_feedback)
         except Exception as e:
             last_err = e
             logger.warning("Episode %d candidate extraction attempt %d failed: %s", ep_num, attempt + 1, e)
 
     is_heuristic = False
-    if not response or "candidate_promos" not in response:
+    candidates_raw = []
+    if response and "candidate_promos" in response:
+        candidates_raw = response.get("candidate_promos", [])
+
+    # If no LLM candidates passed duration after retry
+    valid_llm_candidates = []
+    for cand in candidates_raw:
+        segs = adjust_segments_to_duration(cand.get("segments", []), master_df)
+        is_ok, _, _, _ = resolve_segments_and_duration(segs, master_df)
+        if is_ok:
+            cand["segments"] = segs
+            valid_llm_candidates.append(cand)
+
+    if not valid_llm_candidates:
         if not allow_offline:
-            err_msg = f"Episode {ep_num}: LLM extraction failed ({last_err or 'No response'}). Pass --allow_offline to permit heuristic runs."
+            err_msg = f"Episode {ep_num}: LLM extraction returned 0 valid 20-60s candidates ({last_dur_feedback or last_err or 'No response'}). Pass --allow_offline to permit heuristic runs."
             if failures_log is not None:
                 failures_log.append({"Episode": ep_num, "Reason": err_msg})
             raise RuntimeError(err_msg)
@@ -251,7 +349,7 @@ Extract up to 3 high-impact promotional candidates. Return strictly JSON matchin
         candidates_raw = _extract_promos_offline_heuristic(episode_df, ep_num)
         is_heuristic = True
     else:
-        candidates_raw = response.get("candidate_promos", [])
+        candidates_raw = valid_llm_candidates
 
     source_label = "HEURISTIC_NO_LLM" if is_heuristic else f"LLM:{target_model}"
     valid_candidates = []
