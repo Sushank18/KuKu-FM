@@ -175,15 +175,29 @@ def _call_openai_compatible(
     base_url: Optional[str] = None,
     temperature: float = 0.2,
 ) -> Tuple[Any, int, int]:
-    """Invokes any OpenAI-compatible HTTP endpoint via standard urllib."""
+    """Invokes any OpenAI-compatible HTTP endpoint via standard urllib with schema enforcement."""
     active_key = api_key or os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+    if not active_key:
+        raise ValueError("OpenAI API key not found. Provide api_key or set LLM_API_KEY.")
+
     target_base = base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
     url = f"{target_base.rstrip('/')}/chat/completions"
+
+    # Append JSON schema text to prompt for OpenAI-compatible models
+    full_prompt = prompt
+    if schema:
+        schema_text = json.dumps(schema, indent=2)
+        full_prompt = (
+            f"{prompt}\n\n"
+            f"STRICT JSON OUTPUT REQUIREMENT:\n"
+            f"You MUST respond with valid JSON strictly conforming to this schema:\n"
+            f"{schema_text}"
+        )
 
     messages = []
     if system_instruction:
         messages.append({"role": "system", "content": system_instruction})
-    messages.append({"role": "user", "content": prompt})
+    messages.append({"role": "user", "content": full_prompt})
 
     payload: Dict[str, Any] = {
         "model": model,
@@ -209,8 +223,14 @@ def _call_openai_compatible(
     raw_content = res_json["choices"][0]["message"]["content"]
     parsed = extract_json_from_response(raw_content)
 
+    # Validate that required schema keys exist in response
+    if schema and isinstance(parsed, dict) and "required" in schema:
+        missing_keys = [k for k in schema["required"] if k not in parsed]
+        if missing_keys:
+            raise ValueError(f"OpenAI response missing required JSON schema keys: {missing_keys}")
+
     usage = res_json.get("usage", {})
-    in_tokens = usage.get("prompt_tokens", estimate_token_count(prompt))
+    in_tokens = usage.get("prompt_tokens", estimate_token_count(full_prompt))
     out_tokens = usage.get("completion_tokens", estimate_token_count(raw_content))
 
     return parsed, in_tokens, out_tokens
@@ -275,25 +295,27 @@ def generate_json(
             err_msg = str(e)
             last_error = e
 
-            # Missing API key fails immediately without pointless retries
-            if "API key not found" in err_msg or "API key is required" in err_msg:
+            # Non-retryable errors fail immediately
+            is_non_retryable = (
+                "API key not found" in err_msg or
+                "API key is required" in err_msg or
+                "unauthorized" in err_msg.lower() or
+                "invalid api key" in err_msg.lower()
+            )
+            if is_non_retryable:
                 raise last_error
 
-            # Handle rate limiting (429) or temporary server error (503)
-            is_rate_limit = "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "rate limit" in err_msg.lower()
-            is_server_error = "503" in err_msg or "UNAVAILABLE" in err_msg or "overloaded" in err_msg.lower()
-
-            if (is_rate_limit or is_server_error) and attempt < max_retries - 1:
-                sleep_sec = (2.0 ** attempt) * 2.0
+            # Apply exponential backoff to ALL retryable errors
+            if attempt < max_retries - 1:
+                sleep_sec = (2.0 ** attempt) * 1.5
                 logger.warning(
-                    "LLM call rate-limited/busy (%s). Retrying in %.1fs (attempt %d/%d)...",
+                    "LLM call encountered retryable error (%s). Retrying in %.1fs (attempt %d/%d)...",
                     err_msg[:80], sleep_sec, attempt + 1, max_retries
                 )
                 time.sleep(sleep_sec)
                 continue
             else:
                 logger.error("LLM call failed (attempt %d/%d): %s", attempt + 1, max_retries, e)
-                if attempt == max_retries - 1:
-                    raise last_error
+                raise last_error
 
     raise last_error or RuntimeError("LLM call failed after retries.")

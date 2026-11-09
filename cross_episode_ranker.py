@@ -115,10 +115,12 @@ def run_llm_judge_ranking(
     api_key: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    allow_offline: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Evaluates candidate clips with an explicit multi-dimensional rubric,
     applies deterministic check penalties, and sorts by Rank_Score.
+    Without allow_offline=True, failures in LLM judge raise immediately.
     """
     if not candidates:
         return []
@@ -169,56 +171,74 @@ def run_llm_judge_ranking(
             if cid:
                 judge_results[cid] = ev
     except Exception as e:
-        logger.warning("LLM Judge call failed (%s). Falling back to heuristic scoring.", e)
+        if not allow_offline:
+            raise RuntimeError(f"LLM Judge call failed: {e}. Pass --allow_offline to permit runs without LLM evaluation.")
+        logger.warning("LLM Judge call failed (%s). Running in offline mode without LLM judge scores.", e)
 
     # Score each candidate
     ranked_list = []
     for c in candidates:
         cid = c.get("candidate_id", "")
-        j_eval = judge_results.get(cid, {})
+        j_eval = judge_results.get(cid)
 
-        hook_s = j_eval.get("hook_strength", c.get("hook_score", 7))
-        cliff_s = j_eval.get("cliffhanger", c.get("cliffhanger_score", 7))
-        clarity_s = j_eval.get("standalone_clarity", c.get("standalone_score", 7))
-        intense_s = j_eval.get("emotional_intensity", 7)
-        nov_s = j_eval.get("novelty", 7)
-        why_first = j_eval.get("why_post_first", c.get("Justification", "Strong dramatic hook with standalone appeal."))
+        if j_eval and all(k in j_eval for k in ["hook_strength", "cliffhanger", "standalone_clarity", "emotional_intensity", "novelty"]):
+            hook_s = float(j_eval["hook_strength"])
+            cliff_s = float(j_eval["cliffhanger"])
+            clarity_s = float(j_eval["standalone_clarity"])
+            intense_s = float(j_eval["emotional_intensity"])
+            nov_s = float(j_eval["novelty"])
+            why_first = str(j_eval.get("why_post_first", c.get("Justification", "")))
 
-        # Base rubric calculation (0-100)
-        base_score = (
-            hook_s * 2.5 +
-            cliff_s * 2.5 +
-            clarity_s * 2.0 +
-            intense_s * 2.0 +
-            nov_s * 1.0
-        )
+            # Base rubric calculation (0-100)
+            base_score = (
+                hook_s * 2.5 +
+                cliff_s * 2.5 +
+                clarity_s * 2.0 +
+                intense_s * 2.0 +
+                nov_s * 1.0
+            )
 
-        # Apply deterministic check penalties
-        penalties = 0.0
-        if "FAIL" in str(c.get("Check_Hook", "")):
-            penalties += 15.0
-        if "FAIL" in str(c.get("Check_Start", "")):
-            penalties += 20.0
-        if "FAIL" in str(c.get("Check_End", "")):
-            penalties += 15.0
-        if "needs_context" in str(c.get("Check_Context", "")):
-            penalties += 10.0
-        if str(c.get("Cold_Viewer_Pass", "")).upper() == "FAIL":
-            penalties += 10.0
+            # Apply deterministic check penalties
+            penalties = 0.0
+            if "FAIL" in str(c.get("Check_Hook", "")) or "WEAK" in str(c.get("Check_Hook", "")):
+                penalties += 15.0
+            if "FAIL" in str(c.get("Check_Start", "")):
+                penalties += 20.0
+            if "FAIL" in str(c.get("Check_End", "")):
+                penalties += 15.0
+            if "needs_context" in str(c.get("Check_Context", "")):
+                penalties += 10.0
+            # Cold viewer: only penalize if explicit FAIL (do not penalize UNKNOWN or PASS)
+            if str(c.get("Cold_Viewer_Pass", "")).upper() == "FAIL":
+                penalties += 10.0
 
-        final_score = round(max(0.0, min(100.0, base_score - penalties)), 1)
+            final_score = round(max(0.0, min(100.0, base_score - penalties)), 1)
+            c["Rank_Score"] = final_score
+            c["Why_Post_First"] = why_first
+            c["Judge_Hook"] = hook_s
+            c["Judge_Cliffhanger"] = cliff_s
+            c["Judge_Clarity"] = clarity_s
+            c["Judge_Intensity"] = intense_s
+            c["Judge_Novelty"] = nov_s
+            c["Rank_Flag"] = "SCORED"
+        else:
+            # Missing judge scores -> Rank_Score NaN and rank last, flagged
+            c["Rank_Score"] = float("nan")
+            c["Why_Post_First"] = "heuristic window, no LLM description"
+            c["Judge_Hook"] = float("nan")
+            c["Judge_Cliffhanger"] = float("nan")
+            c["Judge_Clarity"] = float("nan")
+            c["Judge_Intensity"] = float("nan")
+            c["Judge_Novelty"] = float("nan")
+            c["Rank_Flag"] = "UNRANKED_NO_LLM_SCORE"
 
-        c["Rank_Score"] = final_score
-        c["Why_Post_First"] = why_first
-        c["Judge_Hook"] = hook_s
-        c["Judge_Cliffhanger"] = cliff_s
-        c["Judge_Clarity"] = clarity_s
-        c["Judge_Intensity"] = intense_s
-        c["Judge_Novelty"] = nov_s
         ranked_list.append(c)
 
-    # Sort descending by Rank_Score
-    ranked_list.sort(key=lambda x: x["Rank_Score"], reverse=True)
+    # Sort descending by Rank_Score (NaNs rank last)
+    ranked_list.sort(
+        key=lambda x: (-999.0 if pd.isna(x.get("Rank_Score")) else x["Rank_Score"]),
+        reverse=True
+    )
 
     # Assign integer Rank (1, 2, 3...)
     for rank_idx, item in enumerate(ranked_list, 1):

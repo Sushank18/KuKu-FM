@@ -161,16 +161,14 @@ def _extract_promos_offline_heuristic(episode_df: pd.DataFrame, ep_num: int) -> 
 
     results = []
     for c in top_candidates:
-        s_row = c["start_row"]
-        e_row = c["end_row"]
         results.append({
             "segments": [{"start_line_id": c["start_line_id"], "end_line_id": c["end_line_id"]}],
-            "hook_score": 8,
-            "cliffhanger_score": 8,
-            "standalone_score": 8,
-            "hook": f"Confrontation opens: [{s_row.get('Entity_Type')}]: {str(s_row.get('Content'))[:60]}",
-            "cliffhanger": f"Tension peaks: [{e_row.get('Entity_Type')}]: {str(e_row.get('Content'))[:60]}",
-            "why": "High dramatic tension and strong character confrontation ideal for ad conversion."
+            "hook_score": float("nan"),
+            "cliffhanger_score": float("nan"),
+            "standalone_score": float("nan"),
+            "hook": "heuristic window, no LLM description",
+            "cliffhanger": "heuristic window, no LLM description",
+            "why": "heuristic window, no LLM description"
         })
 
     return results
@@ -182,6 +180,7 @@ def extract_promos_for_episode(
     api_key: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    allow_offline: bool = False,
     failures_log: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -192,6 +191,7 @@ def extract_promos_for_episode(
         return []
 
     ep_num = int(episode_df.iloc[0].get("Episode", 1))
+    target_model = model or os.getenv("GEMINI_MODEL") or os.getenv("LLM_MODEL") or "gemini-3.5-flash-lite"
     script_text, logline, continuity = format_numbered_script(episode_df)
 
     prompt = f"""You are an elite short-form vertical video ad editor (Kuku, ReelShort, TikTok).
@@ -217,6 +217,7 @@ Extract up to 3 high-impact promotional candidates. Return strictly JSON matchin
     system_instruction = "You are an expert microdrama promotional video editor. Output valid JSON matching the schema."
 
     response = None
+    last_err = None
     for attempt in range(2):
         try:
             curr_prompt = prompt
@@ -229,19 +230,30 @@ Extract up to 3 high-impact promotional candidates. Return strictly JSON matchin
                 system_instruction=system_instruction,
                 api_key=api_key,
                 provider=provider,
-                model=model,
+                model=target_model,
                 temperature=0.2,
             )
             if response and "candidate_promos" in response:
                 break
         except Exception as e:
+            last_err = e
             logger.warning("Episode %d candidate extraction attempt %d failed: %s", ep_num, attempt + 1, e)
 
+    is_heuristic = False
     if not response or "candidate_promos" not in response:
-        logger.info("Falling back to deterministic line-ID candidate generation for Episode %d...", ep_num)
+        if not allow_offline:
+            err_msg = f"Episode {ep_num}: LLM extraction failed ({last_err or 'No response'}). Pass --allow_offline to permit heuristic runs."
+            if failures_log is not None:
+                failures_log.append({"Episode": ep_num, "Reason": err_msg})
+            raise RuntimeError(err_msg)
+
+        logger.info("Running deterministic heuristic candidate generation for Episode %d (allow_offline=True)...", ep_num)
         candidates_raw = _extract_promos_offline_heuristic(episode_df, ep_num)
+        is_heuristic = True
     else:
         candidates_raw = response.get("candidate_promos", [])
+
+    source_label = "HEURISTIC_NO_LLM" if is_heuristic else f"LLM:{target_model}"
     valid_candidates = []
 
     for c_idx, cand in enumerate(candidates_raw, 1):
@@ -269,9 +281,6 @@ Extract up to 3 high-impact promotional candidates. Return strictly JSON matchin
         # Collect all rows between the start and end of segments
         clip_line_dfs = []
         for r_seg in resolved_segs:
-            s_id = r_seg["start_line_id"]
-            e_id = r_seg["end_line_id"]
-            # Filter rows by episode and timestamp range
             seg_mask = (
                 (master_df["Episode"] >= r_seg["episode_start"]) &
                 (master_df["Episode"] <= r_seg["episode_end"]) &
@@ -285,19 +294,23 @@ Extract up to 3 high-impact promotional candidates. Return strictly JSON matchin
         # Run deterministic checks
         det_checks = run_all_deterministic_checks(clip_lines, start_time_sec)
 
-        # Build transcript snippet
+        # Build transcript snippet for cold viewer
         snippet_lines = []
         for _, row in clip_lines.iterrows():
             snippet_lines.append(f"{row.get('Entity_Type', 'ACTION')}: {row.get('Content', '')}")
         transcript_snippet = "\n".join(snippet_lines)
 
-        # Run Cold Viewer Audit
-        cold_pass, cold_reason = run_cold_viewer_audit(
-            transcript_snippet=transcript_snippet,
-            api_key=api_key,
-            provider=provider,
-            model=model
-        )
+        # Cold Viewer Pass
+        if is_heuristic:
+            cold_status = "UNKNOWN"
+            cold_reason = "Cold viewer audit not run in offline heuristic mode."
+        else:
+            cold_status, cold_reason = run_cold_viewer_audit(
+                transcript_snippet=transcript_snippet,
+                api_key=api_key,
+                provider=provider,
+                model=target_model
+            )
 
         # Build formatted segment timestamps string
         seg_str_parts = []
@@ -308,6 +321,7 @@ Extract up to 3 high-impact promotional candidates. Return strictly JSON matchin
         segments_summary = "; ".join(seg_str_parts)
 
         valid_candidates.append({
+            "Source": source_label,
             "Episode": ep_num,
             "Start_Time": seconds_to_timecode(start_time_sec),
             "End_Time": seconds_to_timecode(end_time_sec),
@@ -321,17 +335,16 @@ Extract up to 3 high-impact promotional candidates. Return strictly JSON matchin
             "Hook_Description": cand.get("hook", ""),
             "Cliffhanger_Description": cand.get("cliffhanger", ""),
             "Justification": cand.get("why", ""),
-            "hook_score": cand.get("hook_score", 7),
-            "cliffhanger_score": cand.get("cliffhanger_score", 7),
-            "standalone_score": cand.get("standalone_score", 7),
+            "hook_score": cand.get("hook_score"),
+            "cliffhanger_score": cand.get("cliffhanger_score"),
+            "standalone_score": cand.get("standalone_score"),
             "Check_Hook": det_checks["Check_Hook"],
             "Check_Start": det_checks["Check_Start"],
             "Check_End": det_checks["Check_End"],
             "Check_Context": det_checks["Check_Context"],
             "All_Checks_Passed": det_checks["All_Checks_Passed"],
-            "Cold_Viewer_Pass": "PASS" if cold_pass else "FAIL",
+            "Cold_Viewer_Pass": cold_status,
             "Cold_Viewer_Reason": cold_reason,
-            "Transcript_Snippet": transcript_snippet[:400],
             "raw_segments": resolved_segs,
         })
 
@@ -343,11 +356,40 @@ def run_cold_viewer_audit(
     api_key: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
-) -> Tuple[bool, str]:
+) -> Tuple[str, str]:
     """
     Second LLM pass: Audits whether a viewer who never saw the show
     understands who is speaking, what the central conflict is, and why it matters.
+    Returns (status, reason), where status is 'PASS', 'FAIL', or 'UNKNOWN' on error.
     """
+    prompt = f"""You are a first-time viewer scrolling social media (TikTok/Reels/Shorts).
+You have NEVER watched this show before. Read ONLY this raw audio-visual clip transcript:
+
+{transcript_snippet}
+
+Question: Does a first-time viewer immediately understand who the key characters are, what the conflict is, and why they should care?
+If crucial context is completely missing (e.g. unknown names with no clue who they are, confusing unanchored dialogue), answer pass: false.
+If the dramatic stakes and conflict are clear on their own, answer pass: true.
+
+Return strictly JSON matching schema:
+{{"pass": true/false, "reason": "one concise sentence explaining why"}}
+"""
+
+    try:
+        res = generate_json(
+            prompt=prompt,
+            schema=COLD_VIEWER_SCHEMA,
+            system_instruction="You are a cold viewer auditing video ad clarity. Output valid JSON.",
+            api_key=api_key,
+            provider=provider,
+            model=model,
+            temperature=0.1
+        )
+        passed = bool(res.get("pass", True))
+        return ("PASS" if passed else "FAIL"), str(res.get("reason", "Clear standalone tension."))
+    except Exception as e:
+        logger.warning("Cold viewer audit failed: %s", e)
+        return "UNKNOWN", f"Cold viewer audit unavailable ({e})"
     prompt = f"""You are a first-time viewer scrolling social media (TikTok/Reels/Shorts).
 You have NEVER watched this show before. Read ONLY this raw audio-visual clip transcript:
 

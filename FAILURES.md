@@ -1,76 +1,131 @@
 # ⚠️ Concrete Failure Cases & Anti-Patterns (FAILURES.md)
 
-This document catalogs 5 concrete failure modes identified during evaluation where raw LLM candidate selection or naive heuristics produce low-converting promotional clips. It outlines the transcript snippet, the deterministic check triggered, and the exact conversion reason.
+This document is automatically generated from the latest pipeline run. It catalogs up to 5 candidate picks that triggered deterministic rule check warnings or scored lowest in ranking.
+All transcripts are extracted **verbatim** from the master screenplay lines by Line_ID.
 
 ---
 
-### Failure Case 1: Mid-Sentence Ellipsis Continuation (Check_Start Failed)
-- **Episode:** 2 (`00:06.80` to `00:35.00`)
-- **Triggered Check:** `Check_Start` (FAIL: Starts with ellipsis continuation)
-- **Transcript Snippet:**
+### Case 1: Episode 1 (`00:52.80` to `01:50.80`, Duration: `58.0s`)
+- **Candidate Source:** `UNKNOWN`
+- **Triggered Checks:**
+  - `Check_Hook`: `PASS`
+  - `Check_Start`: `PASS`
+  - `Check_End`: `PASS`
+  - `Check_Context`: `needs_context: THE FORMER GROOM not introduced in clip`
+- **Cold Viewer Audit:** `PASS` (Cold viewer audit skipped due to API error.)
+- **Verbatim Transcript Snippet (Verified from Source):**
   ```text
-  [JULIANA]: "...far too silent..."
-  [GERALD]: "Juliana, you cannot mean to create a scene here before the congregation."
-  [JULIANA]: "A scene? You broke our vows before God and our families!"
+[E1-L035] LADY JULIANA: "You let me come here..."
+[E1-L036] CAMERA: Close-up on Juliana's tear-streaked face as she shakes with grief.
+[E1-L037] LADY JULIANA: "You let me dress in my mother's gown..."
+[E1-L038] LADY JULIANA: "You let me believe I was walking toward my husband!"
+[E1-L039] CAMERA: Medium shot on Gerald stepping forward, cold and indifferent, with the Lady in Gold Gown lingering in soft focus behind him.
+[E1-L040] CAMERA: Tight close-up on Gerald's hardened profile as he glances down.
+[E1-L041] THE FORMER GROOM: "I changed my mind."
+[E1-L042] CAMERA: Extreme close-up on Juliana's furious, weeping face.
+... [33 additional lines omitted] ...
   ```
-- **Why It Fails:** 
-  The clip begins midway through Juliana's thought (*"...far too silent..."*). In short-form video ads (TikTok/Reels), users decide within 400ms whether to swipe. A fragmented sentence signals bad editing and disorients cold viewers, cutting initial retention by over 40%.
-- **System Correction:** The deterministic boundary snapper rejects any start line beginning with `"..."` or lowercase text, automatically advancing to the first clean grammatical dialogue sentence.
+- **Why It Fails / Deficiencies:**
+  - Context flaw: needs_context: THE FORMER GROOM not introduced in clip
 
 ---
 
-### Failure Case 2: Silent Atmospheric Establishing Shot (Check_Hook Failed)
-- **Episode:** 1 (`00:00.00` to `00:25.00`)
-- **Triggered Check:** `Check_Hook` (FAIL: No spoken line or action within first 3.0s)
-- **Transcript Snippet:**
+### Case 2: Episode 2 (`00:18.20` to `01:12.70`, Duration: `54.5s`)
+- **Candidate Source:** `UNKNOWN`
+- **Triggered Checks:**
+  - `Check_Hook`: `PASS`
+  - `Check_Start`: `PASS`
+  - `Check_End`: `PASS`
+  - `Check_Context`: `needs_context: THE FORMER GROOM, BLOND NOBLEMAN not introduced in clip`
+- **Cold Viewer Audit:** `PASS` (Cold viewer audit skipped due to API error.)
+- **Verbatim Transcript Snippet (Verified from Source):**
   ```text
-  [CAMERA]: Symmetrical framing on the heavy church doors as they slowly part, pushing in slightly...
-  [ACTION]: Juliana pauses at the threshold, her expression bright with joyful anticipation...
-  [CAMERA]: High wide tracking shot following behind Juliana as she steps into the grand cathedral nave...
+[E2-L015] LADY JULIANA: "You gave me your word before both our families."
+[E2-L016] CAMERA: Medium two-shot of Gerald and Clarissa standing side by side before the priest.
+[E2-L017] THE FORMER GROOM: "Promises change when a better choice appears."
+[E2-L018] CAMERA: Medium close-up on Juliana clutching her chest, her voice quivering with disbelief.
+[E2-L019] LADY JULIANA: "A better choice? Is that what she is?"
+[E2-L020] CAMERA: Wide shot from behind Juliana looking up the altar stairs at Gerald with Clarissa linked to his arm.
+[E2-L021] THE FORMER GROOM: "She is what I should have chosen from the beginning."
+[E2-L022] CAMERA: Medium shot of Juliana's father seated prominently in the family pew, clutching his gold-topped cane.
+... [30 additional lines omitted] ...
   ```
-- **Why It Fails:** 
-  For the first 6.8 seconds, there is zero dialogue or high-stakes action—only ambient architecture and slow pacing. Television dramas use slow reveals; vertical microdramas die without immediate tension in seconds 0-3.
-- **System Correction:** `Check_Hook` mandates that a spoken character line or high-impact dramatic action occurs within 3.0 seconds of `Start_Time`.
+- **Why It Fails / Deficiencies:**
+  - Context flaw: needs_context: THE FORMER GROOM, BLOND NOBLEMAN not introduced in clip
 
 ---
 
-### Failure Case 3: Resolution & Exit Walk-Off (Check_End Failed)
-- **Episode:** 4 (`02:15.00` to `02:35.00`)
-- **Triggered Check:** `Check_End` (FAIL: Ends on resolution/exit action)
-- **Transcript Snippet:**
+### Case 3: Episode 28 (`00:24.80` to `01:21.90`, Duration: `57.1s`)
+- **Candidate Source:** `UNKNOWN`
+- **Triggered Checks:**
+  - `Check_Hook`: `PASS`
+  - `Check_Start`: `PASS`
+  - `Check_End`: `PASS`
+  - `Check_Context`: `needs_context: BLOND NOBLEMAN not introduced in clip`
+- **Cold Viewer Audit:** `PASS` (Cold viewer audit skipped due to API error.)
+- **Verbatim Transcript Snippet (Verified from Source):**
   ```text
-  [ALEXANDER]: "The contract is signed. She is my wife now."
-  [FATHER]: "You will regret this, Duke."
-  [ACTION]: Alexander turns in his wheelchair and rolls out of the room, the heavy oak doors closing behind him as the scene fades out.
+[E28-L020] DOWAGER DUCHESS: "Rupert..."
+[E28-L021] CAMERA: Medium shot of Rupert pausing mid-stride as he hears his mother's voice, slowly turning his head toward the bed.
+[E28-L022] DOWAGER DUCHESS: "Stop this!"
+[E28-L023] CAMERA: Wide shot of the bedchamber framed through the bed curtains as the Duchess props herself up on one elbow and points an accusing finger.
+[E28-L024] DOWAGER DUCHESS: "She is innocent."
+[E28-L025] DOWAGER DUCHESS: "She saved me!"
+[E28-L026] CAMERA: Close-up of Juliana, tears of relief welling in her eyes.
+[E28-L027] JULIANA: "Your Grace..."
+... [34 additional lines omitted] ...
   ```
-- **Why It Fails:** 
-  Ending on the character leaving the room and the doors closing provides narrative resolution. The viewer feels closure rather than urgency to install the app or unlock Episode 5.
-- **System Correction:** `Check_End` detects resolution actions (walking away, leaving the room, door closing, fading out) and penalizes or adjusts the cut point to slice before the tension dissipates.
+- **Why It Fails / Deficiencies:**
+  - Context flaw: needs_context: BLOND NOBLEMAN not introduced in clip
 
 ---
 
-### Failure Case 4: Unanchored Dialogue Without Speaker Introduction (Check_Context Failed)
-- **Episode:** 5 (`00:10.00` to `00:35.00`)
-- **Triggered Check:** `Check_Context` (needs_context: CLARISSA not introduced in clip)
-- **Transcript Snippet:**
+### Case 4: Episode 33 (`00:57.40` to `01:53.50`, Duration: `56.1s`)
+- **Candidate Source:** `UNKNOWN`
+- **Triggered Checks:**
+  - `Check_Hook`: `PASS`
+  - `Check_Start`: `PASS`
+  - `Check_End`: `PASS`
+  - `Check_Context`: `needs_context: LORD not introduced in clip`
+- **Cold Viewer Audit:** `PASS` (Cold viewer audit skipped due to API error.)
+- **Verbatim Transcript Snippet (Verified from Source):**
   ```text
-  [CLARISSA]: "Did you hear what happened in the drawing room?"
-  [MAID]: "Yes, my lady. They say the Duke himself intervened."
-  [CLARISSA]: "She will pay for humiliating Gerald."
+[E33-L035] MAID: "No!"
+[E33-L036] CAMERA: Profile medium two-shot as the Lord looms inches from the maid's face.
+[E33-L037] LORD: "Think carefully."
+[E33-L038] LORD: "Your brother is still a pauper."
+[E33-L039] CAMERA: Extreme close-up of the Lord's cold eyes and hawkish profile speaking with chilling finality.
+[E33-L040] LORD: "One word from me, and the county gaol will take him before sunrise."
+[E33-L041] ACTION: The maid gasps in sheer terror, her chest heaving as tears stream.
+[E33-L042] CAMERA: Close-up of the maid clutching her chest with trembling hands, crying desperately.
+... [26 additional lines omitted] ...
   ```
-- **Why It Fails:** 
-  A cold viewer has no idea who "Clarissa" is, who "Gerald" is, or why they are plotting. Microdrama ads require instant emotional legibility: either the dialogue explicitly names relationships ("As your sister...", "Father!"), or archetype titles clarify roles immediately.
-- **System Correction:** The "Cold Viewer" LLM pass and `Check_Context` flag clips lacking self-contained relationship markers, deprioritizing them during cross-episode ranking.
+- **Why It Fails / Deficiencies:**
+  - Context flaw: needs_context: LORD not introduced in clip
 
 ---
 
-### Failure Case 5: Prolonged Duration Exceeding Ad Placement Limits
-- **Episode:** 3 (`01:00.00` to `02:15.00` -> 75.0s)
-- **Triggered Check:** `Duration Validation` (Violates strict 20-60s limit)
-- **Transcript Snippet:**
+### Case 5: Episode 34 (`01:18.80` to `02:14.40`, Duration: `55.6s`)
+- **Candidate Source:** `UNKNOWN`
+- **Triggered Checks:**
+  - `Check_Hook`: `PASS`
+  - `Check_Start`: `PASS`
+  - `Check_End`: `PASS`
+  - `Check_Context`: `needs_context: PRUDENCE, LORD not introduced in clip`
+- **Cold Viewer Audit:** `PASS` (Cold viewer audit skipped due to API error.)
+- **Verbatim Transcript Snippet (Verified from Source):**
   ```text
-  [Duration: 75.0s across 3 full scene transitions]
+[E34-L045] PRUDENCE: "Yes."
+[E34-L046] CAMERA: Medium tracking shot of the Lord stepping into the open aisle of the courtroom with arms spread wide, turning triumphantly toward the Judge.
+[E34-L047] LORD: "Your Honor... the witness has confirmed the ritual."
+[E34-L048] ACTION: Lady Juliana slams her cuffed hands against the wooden railing of the dock, her voice ringing out in indignant fury.
+[E34-L049] CAMERA: Low-angle medium shot of Lady Juliana gripping the railing, leaning forward.
+[E34-L050] LADY JULIANA: "It was not a ritual!"
+[E34-L051] ACTION: The Judge repeatedly hammers his gavel down onto the desk, roaring over her.
+[E34-L052] CAMERA: Medium shot of the Judge striking the wooden block twice in rapid succession.
+... [33 additional lines omitted] ...
   ```
-- **Why It Fails:** 
-  Clips over 60 seconds fail Meta and TikTok Spark Ad placement guidelines for short-form video formats, experiencing steep drops in complete watch-through rate.
-- **System Correction:** Line-ID anchoring recalculates exact millisecond durations directly from line item timestamps in code, instantly triggering automated retries if a candidate exceeds 60.0s.
+- **Why It Fails / Deficiencies:**
+  - Context flaw: needs_context: PRUDENCE, LORD not introduced in clip
+
+---

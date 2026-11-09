@@ -158,30 +158,25 @@ streamlit run app.py
 
 ## 📈 Quality Evidence & Evaluation (FAILURES.md)
 
-Evaluation runs against `eval/labels.csv` (10 hand-labeled gold-standard clips):
-- **Precision@1:** `100.0%`
-- **Precision@3:** `100.0%`
-- **Precision@5:** `100.0%`
+Precision metrics are computed by `evaluate.py` by strictly matching top candidate promos against ground truth labels in `eval/labels.csv` with temporal overlap $IoU \ge 0.35$.
+When `eval/labels.csv` has fewer than 3 overlapping labeled clips, `evaluate.py` reports `insufficient labels` rather than assuming unlabelled clips are correct.
 
-See [`FAILURES.md`](file:///c:/22134028%20%20SUSHANK/KuKu_FM/FAILURES.md) for 5 documented concrete bad picks, including:
-1. Mid-sentence continuation fragment (`...far too silent...`) $\rightarrow$ Rejected by `Check_Start`.
-2. Silent atmospheric establishing shot (no action in first 3s) $\rightarrow$ Rejected by `Check_Hook`.
-3. Resolution & exit walk-off (spoiled tension before cut) $\rightarrow$ Rejected by `Check_End`.
-4. Dialogue with unintroduced characters $\rightarrow$ Flagged by `Check_Context`.
-5. Prolonged clip outside 60s $\rightarrow$ Rejected by code-level line duration validation.
+See [`FAILURES.md`](FAILURES.md) for 5 concrete bad picks dynamically extracted and verified from the screenplay lines, explaining:
+1. Action-only opening without dialogue in first 3s (flagged by `Check_Hook`).
+2. Mid-sentence continuation fragment or lowercase start (flagged by `Check_Start`).
+3. Resolution and exit walk-off in the final 2 lines (flagged by `Check_End`).
+4. Dialogue with unintroduced characters (flagged by `Check_Context`).
+5. Duration exceeding 60s (rejected by code-level line duration validation).
 
 ---
 
-## 🌐 Production Scaling to Every Show
+## 🌐 Production Scaling & Cost
 
-### 1. Cost per Episode & Show Economics
-Using `gemini-3.5-flash-lite` or `gpt-4o-mini`:
-- **Input Tokens per Episode**: ~1,800 tokens (numbered transcript + logline + continuity notes).
-- **Output Tokens per Episode**: ~350 tokens (structured JSON with up to 3 candidate promos).
-- **Cold Viewer Audit**: ~200 input / 50 output tokens.
-- **Cross-Episode Judge**: ~4,000 input tokens once for the whole show.
-- **Cost per Episode**: **~$0.0004 USD** (less than half a cent per episode).
-- **Cost for a full 50-episode microdrama series**: **~$0.025 USD** (under 3 cents total).
+### 1. Cost & Execution Tracking
+- **Cost in Latest Run:** Not measured (0 API calls in `--allow_offline` mode). When executed with an active Gemini or OpenAI API key, exact input/output tokens and USD cost are recorded in `run_log.txt`.
+- **Output Source Tagging:**
+  - Candidates generated via heuristic fallback carry `Source="HEURISTIC_NO_LLM"`. Their scores (`hook_score`, `cliffhanger_score`, `standalone_score`, `Judge_*`, `Rank_Score`) are left empty (`NaN`), and creative copy fields are empty strings.
+  - Candidates generated via active LLM calls carry `Source="LLM:<model>"` with model evaluations.
 
 ### 2. Batching & Concurrency
 - Episodic scripts are embarrassingly parallel. Screenplay ingestion and candidate extraction can be distributed across worker threads or asynchronous Celery/Cloud Tasks workers.
@@ -200,18 +195,3 @@ For production ad spend (where thousands of dollars are allocated to top promos 
 1. **Screenplay Formatting**: Assumes screenplays follow standard industry microdrama notation (`**CHARACTER (Emotion):** Start: (MM:SS) | End: (MM:SS)` or multi-line blocks). Irregular formatting is caught and logged to `failures.csv`.
 2. **Visual Acting Nuances**: Screenplay text descriptions may not fully capture non-verbal physical chemistry or micro-expressions that only appear on camera. The human review step in `app.py` accounts for final video review.
 3. **Cross-Scene Audio Bleed**: For maximum audio quality, cutting video clips on dialogue starts requires re-encoding with FFmpeg (`-c:v libx264 -c:a aac`) rather than stream copying (`-c copy`) to avoid cutting on non-keyframes.
-
----
-
-## 🧪 Verification Summary
-
-| Component | Status | Verification Method |
-|---|:---:|---|
-| Deterministic Ingestion (50 eps $\rightarrow$ 3,727 rows) | **VERIFIED** | `python tests/smoke_test.py` (Asserts 3,727 lines, integer episodes) |
-| Line-ID Anchoring (`E1-L001` .. `E50-L001`) | **VERIFIED** | Offline smoke test assertions & regex parser tests |
-| Deterministic Checks (Hook, Start, End, Context) | **VERIFIED** | `test_deterministic_checks()` unit & integration asserts |
-| Duration Math Verification (20–60s) | **VERIFIED** | `resolve_segments_and_duration` plain assert tests |
-| Swappable Model Client (`llm_client.py`) | **VERIFIED** | Centralized SDK import isolation & usage tracking |
-| Evaluation Suite (`evaluate.py`) | **VERIFIED** | Executed offline against `eval/labels.csv` |
-| Concrete Failure Documentation | **VERIFIED** | Generated `FAILURES.md` with 5 detailed cases |
-| Streamlit Application (`app.py`) | **VERIFIED** | Dual tabs, session-only API keys, compiled with zero errors |

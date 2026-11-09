@@ -116,15 +116,11 @@ Provide 3 punchy on-screen text overlays (under 7 words each), a viral social ca
             temperature=0.4,
         )
     except Exception as e:
-        logger.warning("Creative generation fallback for Episode %s: %s", episode_id, e)
+        logger.warning("Creative generation failed for Episode %s: %s", episode_id, e)
         return {
-            "on_screen_hook_options": [
-                "Betrayed At The Altar",
-                "She Wore White. He Chose Her Sister.",
-                "The Ultimate Betrayal"
-            ],
-            "social_caption": "Her wedding dress wasn't even cold when her sister took her groom... Would you ever forgive this? 💔",
-            "hashtags": ["#microdrama", "#betrayal", "#drama", "#reels", "#fyp"],
-            "call_to_action": "Tap the link to watch what happens next!"
+            "on_screen_hook_options": [],
+            "social_caption": "",
+            "hashtags": [],
+            "call_to_action": ""
         }
 

@@ -81,6 +81,7 @@ def run_pipeline(
     api_key: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    allow_offline: bool = False,
     min_dur: float = 20.0,
     max_dur: float = 60.0
 ) -> Dict[str, Any]:
@@ -168,6 +169,7 @@ def run_pipeline(
             api_key=api_key,
             provider=provider,
             model=model,
+            allow_offline=allow_offline,
             failures_log=failures_log
         )
 
@@ -187,7 +189,8 @@ def run_pipeline(
         candidates=deduped_candidates,
         api_key=api_key,
         provider=provider,
-        model=model
+        model=model,
+        allow_offline=allow_offline
     )
 
     # 7. Package viral marketing creatives & generate .srt subtitles
@@ -197,6 +200,7 @@ def run_pipeline(
         ep_num = cand.get("Episode", 1)
         start_sec = cand.get("Start_Sec", 0.0)
         end_sec = cand.get("End_Sec", 30.0)
+        is_heuristic = (cand.get("Source") == "HEURISTIC_NO_LLM")
 
         # Generate Subtitle file (.srt)
         srt_filename = f"promo_ep{ep_num}_{int(start_sec)}s_{int(end_sec)}s.srt"
@@ -211,37 +215,43 @@ def run_pipeline(
             include_speaker_names=True
         )
 
-        # Marketing copy
-        creatives = generate_marketing_creatives(
-            episode_id=ep_num,
-            hook_desc=cand.get("Hook_Description", ""),
-            cliffhanger_desc=cand.get("Cliffhanger_Description", ""),
-            transcript_text=cand.get("Transcript_Snippet", ""),
-            model_name=model,
-            api_key=api_key,
-            provider=provider
-        )
-        thumbnail_sec = calculate_optimal_thumbnail_timestamp(
-            screenplay_df=screenplay_df,
-            episode_id=ep_num,
-            clip_start_sec=start_sec,
-            clip_end_sec=end_sec
-        )
-
-        hook_opts = creatives.get("on_screen_hook_options", [])
-        hook_1 = hook_opts[0] if len(hook_opts) > 0 else "Must-Watch Betrayal"
-        hook_2 = hook_opts[1] if len(hook_opts) > 1 else ""
-        hook_3 = hook_opts[2] if len(hook_opts) > 2 else ""
-
-        cand["Rank"] = rank_idx
-        cand["On_Screen_Hook_1"] = hook_1
-        cand["On_Screen_Hook_2"] = hook_2
-        cand["On_Screen_Hook_3"] = hook_3
-        cand["Social_Caption"] = creatives.get("social_caption", "")
-        cand["Hashtags"] = " ".join(creatives.get("hashtags", []))
-        cand["Call_To_Action"] = creatives.get("call_to_action", "")
-        cand["Thumbnail_Frame_Sec"] = thumbnail_sec
-        cand["SRT_Subtitle_Path"] = srt_path
+        if is_heuristic:
+            # Under --allow_offline heuristic, creatives are left strictly empty
+            cand["Rank"] = rank_idx
+            cand["On_Screen_Hook_1"] = ""
+            cand["On_Screen_Hook_2"] = ""
+            cand["On_Screen_Hook_3"] = ""
+            cand["Social_Caption"] = ""
+            cand["Hashtags"] = ""
+            cand["Call_To_Action"] = ""
+            cand["Thumbnail_Frame_Sec"] = start_sec + 2.0
+            cand["SRT_Subtitle_Path"] = srt_path
+        else:
+            creatives = generate_marketing_creatives(
+                episode_id=ep_num,
+                hook_desc=cand.get("Hook_Description", ""),
+                cliffhanger_desc=cand.get("Cliffhanger_Description", ""),
+                transcript_text="",
+                model_name=model,
+                api_key=api_key,
+                provider=provider
+            )
+            thumbnail_sec = calculate_optimal_thumbnail_timestamp(
+                screenplay_df=screenplay_df,
+                episode_id=ep_num,
+                clip_start_sec=start_sec,
+                clip_end_sec=end_sec
+            )
+            hook_opts = creatives.get("on_screen_hook_options", [])
+            cand["Rank"] = rank_idx
+            cand["On_Screen_Hook_1"] = hook_opts[0] if len(hook_opts) > 0 else ""
+            cand["On_Screen_Hook_2"] = hook_opts[1] if len(hook_opts) > 1 else ""
+            cand["On_Screen_Hook_3"] = hook_opts[2] if len(hook_opts) > 2 else ""
+            cand["Social_Caption"] = creatives.get("social_caption", "")
+            cand["Hashtags"] = " ".join(creatives.get("hashtags", []))
+            cand["Call_To_Action"] = creatives.get("call_to_action", "")
+            cand["Thumbnail_Frame_Sec"] = thumbnail_sec
+            cand["SRT_Subtitle_Path"] = srt_path
 
         final_records.append(cand)
 
@@ -252,13 +262,12 @@ def run_pipeline(
         # Empty failures log
         pd.DataFrame(columns=["Episode", "Candidate_Idx", "Reason"]).to_csv(failures_csv, index=False)
 
-    # 9. Persist promos.csv and promos.json
+    # 9. Persist promos.csv and promos.json (drop raw objects and transcript snippets)
     promos_df = pd.DataFrame(final_records)
     promos_csv = os.path.join(run_dir, "promos.csv")
     promos_json = os.path.join(run_dir, "promos.json")
 
-    # Drop raw un-serializable objects before saving CSV/JSON
-    serializable_df = promos_df.drop(columns=["raw_segments"], errors="ignore")
+    serializable_df = promos_df.drop(columns=["raw_segments", "Transcript_Snippet"], errors="ignore")
     serializable_df.to_csv(promos_csv, index=False)
 
     with open(promos_json, "w", encoding="utf-8") as f:
@@ -294,20 +303,27 @@ def run_pipeline(
     # 10. Persist run_log.txt
     elapsed_time = round(time.time() - start_time_real, 2)
     stats = get_run_stats()
+    calls_made = stats.get("calls", 0)
 
-    run_log_content = f"""======================================================================
+    # Compute source counts
+    source_counts = dict(serializable_df["Source"].value_counts()) if "Source" in serializable_df.columns else {}
+
+    top_banner = "NO LLM CALLS - HEURISTIC MODE\n" if calls_made == 0 else ""
+
+    run_log_content = f"""{top_banner}======================================================================
 KUKU PROMO EXTRACTION PIPELINE EXECUTION LOG
 ======================================================================
 Timestamp: {timestamp}
 Run Directory: {run_dir}
 Target Episodes: {len(target_episodes)}
 Total Candidate Promos Generated: {len(final_records)}
+Source Counts: {source_counts}
 Execution Elapsed Time: {elapsed_time:.2f} seconds
 
 LLM MODEL & USAGE STATISTICS:
-Provider Used: {stats.get('provider_used') or provider or 'gemini'}
-Model Used: {stats.get('model_used') or model or 'gemini-3.5-flash-lite'}
-Total API Calls: {stats.get('calls', 0)}
+Provider Used: {stats.get('provider_used') or (provider if calls_made > 0 else 'none')}
+Model Used: {stats.get('model_used') or (model if calls_made > 0 else 'none')}
+Total API Calls: {calls_made}
 Prompt (Input) Tokens: {stats.get('input_tokens', 0):,}
 Completion (Output) Tokens: {stats.get('output_tokens', 0):,}
 Total Tokens: {stats.get('total_tokens', 0):,}
@@ -354,6 +370,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--provider", type=str, default=None, help="gemini or openai")
     parser.add_argument("--model", type=str, default=None, help="LLM model name")
+    parser.add_argument(
+        "--allow_offline",
+        action="store_true",
+        default=False,
+        help="Permit deterministic heuristic execution when no LLM API key is present."
+    )
 
     args = parser.parse_args()
     run_pipeline(
@@ -362,5 +384,6 @@ if __name__ == "__main__":
         master_csv=args.master_csv,
         scripts_dir=args.scripts_dir,
         provider=args.provider,
-        model=args.model
+        model=args.model,
+        allow_offline=args.allow_offline
     )

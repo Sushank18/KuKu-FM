@@ -58,8 +58,9 @@ def timecode_to_seconds(tc: str) -> float:
 
 def check_hook_start(clip_lines: pd.DataFrame, start_sec: float) -> Tuple[bool, str]:
     """
-    Check (a): A spoken dialogue line or substantial ACTION begins
-    within 3.0 seconds of the first segment's start time.
+    Check (a): Must require a spoken dialogue line within 3.0s of the clip's start.
+    An ACTION-only opening returns 'WEAK: action only, no dialogue in first 3s'
+    (counts as a failure in All_Checks_Passed).
     """
     if clip_lines.empty:
         return False, "FAIL: Clip contains no script lines"
@@ -67,17 +68,24 @@ def check_hook_start(clip_lines: pd.DataFrame, start_sec: float) -> Tuple[bool, 
     cutoff_sec = start_sec + 3.0
     early_lines = clip_lines[clip_lines["Start_Sec"] <= cutoff_sec]
 
+    has_dialogue = False
+    has_action = False
+
     for _, row in early_lines.iterrows():
         entity = str(row.get("Entity_Type", "")).strip().upper()
         content = str(row.get("Content", "")).strip()
 
         # If it's a spoken dialogue line
         if entity not in NON_DIALOGUE_ENTITIES and entity != "ACTION":
-            return True, "PASS"
+            has_dialogue = True
+            break
+        elif entity == "ACTION" and len(content) > 0:
+            has_action = True
 
-        # If it's an ACTION line with narrative substance
-        if entity == "ACTION" and len(content) > 10:
-            return True, "PASS"
+    if has_dialogue:
+        return True, "PASS"
+    elif has_action:
+        return False, "WEAK: action only, no dialogue in first 3s"
 
     return False, f"FAIL: No spoken line or action within first 3.0s (starts at {start_sec:.2f}s)"
 
@@ -113,20 +121,19 @@ def check_start_line(clip_lines: pd.DataFrame) -> Tuple[bool, str]:
 
 def check_end_line(clip_lines: pd.DataFrame) -> Tuple[bool, str]:
     """
-    Check (c): Last line is not a clear resolution (flag if it ends on
-    an ACTION of walking away / leaving / exiting).
+    Check (c): Last line is not a clear resolution.
+    Inspects the last 2 lines for resolution/exit patterns.
     """
     if clip_lines.empty:
         return False, "FAIL: No lines in clip"
 
-    last_row = clip_lines.iloc[-1]
-    entity = str(last_row.get("Entity_Type", "")).strip().upper()
-    content = str(last_row.get("Content", "")).strip().lower()
-
-    # Check if last line or action indicates exiting / walking away / resolution
-    for pattern in RESOLUTION_EXIT_PATTERNS:
-        if re.search(pattern, content):
-            return False, f"FAIL: Ends on resolution/exit action ('{last_row.get('Content', '')[:40]}')"
+    # Inspect the last 2 lines
+    tail_rows = clip_lines.tail(2)
+    for _, row in tail_rows.iterrows():
+        content = str(row.get("Content", "")).strip().lower()
+        for pattern in RESOLUTION_EXIT_PATTERNS:
+            if re.search(pattern, content):
+                return False, f"FAIL: Ends on resolution/exit action ('{str(row.get('Content', ''))[:40]}')"
 
     return True, "PASS"
 

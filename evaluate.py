@@ -1,10 +1,14 @@
 """
 Quality Evaluation & Failure Audit Suite
 ========================================
-1. Evaluates pipeline precision against hand-labeled ground truth (eval/labels.csv).
-2. Computes Precision@N (Precision@1, Precision@3, Precision@5).
+1. Evaluates pipeline precision against user ground truth (eval/labels.csv).
+2. Computes Precision@N using ONLY clips that overlap user labels (IoU >= 0.35).
+   Reports "n_labelled_matches / N" and prints "insufficient labels" if matches < 3.
 3. Analyzes failure rates across deterministic checks (Check_Hook, Check_Start, Check_End, Check_Context).
-4. Auto-generates FAILURES.md detailing 5 concrete bad promo picks with transcript snippets and failure analysis.
+4. Auto-generates FAILURES.md dynamically from the latest promos.csv:
+   - Picks up to 5 rows with failed checks (or lowest Rank_Score).
+   - Pulls transcripts VERBATIM from master screenplay lines by Line_ID.
+   - Asserts that every quoted line exists in the source script before writing.
 """
 
 import os
@@ -14,6 +18,7 @@ import pandas as pd
 from typing import Dict, Any, List, Tuple, Optional
 
 from deterministic_checks import timecode_to_seconds
+from script_parser import parse_screenplay, episode_number
 
 
 def compute_overlap(s1: float, e1: float, s2: float, e2: float) -> float:
@@ -38,17 +43,49 @@ def find_latest_promos_csv() -> Optional[str]:
     return None
 
 
+def load_master_screenplay_df(
+    master_csv: str = "output/master_parsed_screenplays.csv",
+    scripts_dir: str = os.path.join("Data", "I Married a Broken Soldier. He was a Duke")
+) -> pd.DataFrame:
+    """Loads master parsed dataframe or parses from Data/ directory."""
+    if os.path.exists(master_csv):
+        try:
+            df = pd.read_csv(master_csv)
+            if "Line_ID" in df.columns and not df.empty:
+                return df
+        except Exception:
+            pass
+
+    if os.path.exists(scripts_dir):
+        txt_files = [f for f in os.listdir(scripts_dir) if f.endswith(".txt")]
+        txt_files.sort(key=lambda f: episode_number(f))
+        all_dfs = []
+        for f in txt_files:
+            p = os.path.join(scripts_dir, f)
+            all_dfs.append(parse_screenplay(p, include_extended_metadata=True))
+        if all_dfs:
+            master = pd.concat(all_dfs, ignore_index=True)
+            return master
+
+    return pd.DataFrame()
+
+
 def evaluate_precision_at_n(
     promos_df: pd.DataFrame, 
     labels_df: pd.DataFrame, 
     top_n_list: List[int] = [1, 3, 5]
-) -> Dict[str, float]:
-    """Computes Precision@N for the tool's top-ranked picks against labeled clips."""
-    results: Dict[str, float] = {}
-    if promos_df.empty or labels_df.empty:
-        return {f"Precision@{n}": 0.0 for n in top_n_list}
+) -> Dict[str, str]:
+    """
+    Computes Precision@N using ONLY clips that overlap user labels (IoU >= 0.35).
+    Reports 'n_labelled_matches / N' next to percentage.
+    If there are fewer than 3 matches, reports 'insufficient labels'.
+    """
+    results: Dict[str, str] = {}
+    if promos_df.empty or labels_df.empty or len(labels_df) == 0:
+        for n in top_n_list:
+            results[f"Precision@{n}"] = "insufficient labels (0 matches / 0 labels)"
+        return results
 
-    # Sort promos by Rank or Rank_Score if present
     df = promos_df.copy()
     if "Rank" in df.columns:
         df = df.sort_values(by="Rank", ascending=True)
@@ -57,15 +94,14 @@ def evaluate_precision_at_n(
 
     for n in top_n_list:
         top_slice = df.head(n)
-        correct = 0
-        total_evaluated = 0
+        good_matches = 0
+        total_matches = 0
 
         for _, row in top_slice.iterrows():
             ep = int(row.get("Episode", 1))
             start_sec = timecode_to_seconds(str(row.get("Start_Time", "00:00.00")))
             end_sec = timecode_to_seconds(str(row.get("End_Time", "00:00.00")))
 
-            # Check matches in labels_df
             ep_labels = labels_df[labels_df["Episode"] == ep]
             best_iou = 0.0
             best_label = None
@@ -76,129 +112,168 @@ def evaluate_precision_at_n(
                 iou = compute_overlap(start_sec, end_sec, l_start, l_end)
                 if iou > best_iou:
                     best_iou = iou
-                    best_label = str(lrow.get("Label", "")).lower()
+                    best_label = str(lrow.get("Label", "")).strip().lower()
 
+            # ONLY count if clip overlaps user label with IoU >= 0.35
             if best_iou >= 0.35 and best_label:
-                total_evaluated += 1
+                total_matches += 1
                 if best_label == "good":
-                    correct += 1
-            else:
-                # If unlabelled in ground truth, check deterministic checks as proxy
-                all_passed = "FAIL" not in str(row.get("Check_Hook", "")) and \
-                             "FAIL" not in str(row.get("Check_Start", "")) and \
-                             "FAIL" not in str(row.get("Check_End", ""))
-                total_evaluated += 1
-                if all_passed:
-                    correct += 1
+                    good_matches += 1
 
-        score = (correct / total_evaluated) if total_evaluated > 0 else 0.0
-        results[f"Precision@{n}"] = round(score * 100.0, 1)
+        if total_matches < 3:
+            results[f"Precision@{n}"] = f"insufficient labels ({total_matches}/{n} matches)"
+        else:
+            pct = round((good_matches / total_matches) * 100.0, 1)
+            results[f"Precision@{n}"] = f"{pct}% ({good_matches}/{total_matches} matches)"
 
     return results
 
 
-def evaluate_deterministic_checks(promos_df: pd.DataFrame) -> Dict[str, float]:
+def evaluate_deterministic_checks(promos_df: pd.DataFrame) -> Dict[str, Any]:
     """Computes failure rates for each deterministic check."""
     if promos_df.empty:
         return {}
 
     total = len(promos_df)
-    fail_hook = promos_df["Check_Hook"].astype(str).str.contains("FAIL").sum() if "Check_Hook" in promos_df.columns else 0
+    fail_hook = promos_df["Check_Hook"].astype(str).str.contains("FAIL|WEAK").sum() if "Check_Hook" in promos_df.columns else 0
     fail_start = promos_df["Check_Start"].astype(str).str.contains("FAIL").sum() if "Check_Start" in promos_df.columns else 0
     fail_end = promos_df["Check_End"].astype(str).str.contains("FAIL").sum() if "Check_End" in promos_df.columns else 0
     fail_context = promos_df["Check_Context"].astype(str).str.contains("needs_context").sum() if "Check_Context" in promos_df.columns else 0
 
     return {
         "Total_Candidates_Evaluated": total,
-        "Check_Hook_Fail_Pct": round((fail_hook / total) * 100.0, 1),
-        "Check_Start_Fail_Pct": round((fail_start / total) * 100.0, 1),
-        "Check_End_Fail_Pct": round((fail_end / total) * 100.0, 1),
-        "Check_Context_Needs_Context_Pct": round((fail_context / total) * 100.0, 1),
+        "Check_Hook_Fail_Pct": f"{(fail_hook / total) * 100.0:.1f}% ({fail_hook}/{total})",
+        "Check_Start_Fail_Pct": f"{(fail_start / total) * 100.0:.1f}% ({fail_start}/{total})",
+        "Check_End_Fail_Pct": f"{(fail_end / total) * 100.0:.1f}% ({fail_end}/{total})",
+        "Check_Context_Needs_Context_Pct": f"{(fail_context / total) * 100.0:.1f}% ({fail_context}/{total})",
     }
 
 
-def generate_failures_markdown(output_path: str = "FAILURES.md"):
+def generate_failures_markdown(
+    promos_df: pd.DataFrame,
+    master_df: pd.DataFrame,
+    output_path: str = "FAILURES.md"
+):
     """
-    Auto-generates FAILURES.md documenting 5 concrete bad promotional picks,
-    their raw transcripts, and the specific reasons they fail microdrama conversion.
+    Generates FAILURES.md dynamically from the real latest promos.csv:
+      - Picks up to 5 rows with failed checks (or lowest Rank_Score).
+      - Pulls the transcript VERBATIM from master_df by Line_ID.
+      - Asserts that every quoted line exists in the source script before writing.
     """
-    failures_content = """# ⚠️ Concrete Failure Cases & Anti-Patterns (FAILURES.md)
+    if promos_df.empty or master_df.empty:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("# ⚠️ Failure Cases & Anti-Patterns\n\nNo candidate promos available to audit.\n")
+        return
 
-This document catalogs 5 concrete failure modes identified during evaluation where raw LLM candidate selection or naive heuristics produce low-converting promotional clips. It outlines the transcript snippet, the deterministic check triggered, and the exact conversion reason.
+    # Identify rows with check failures or lowest rank
+    def has_check_issue(row):
+        h = str(row.get("Check_Hook", ""))
+        s = str(row.get("Check_Start", ""))
+        e = str(row.get("Check_End", ""))
+        c = str(row.get("Check_Context", ""))
+        cv = str(row.get("Cold_Viewer_Pass", ""))
+        return ("FAIL" in h or "WEAK" in h or "FAIL" in s or "FAIL" in e or "needs_context" in c or cv == "FAIL")
 
----
+    issue_rows = promos_df[promos_df.apply(has_check_issue, axis=1)]
+    if len(issue_rows) < 5:
+        # Fill remaining with lowest Rank_Score rows
+        other_rows = promos_df[~promos_df.index.isin(issue_rows.index)].sort_values(
+            by="Rank_Score", ascending=True, na_position="first"
+        )
+        selected_rows = pd.concat([issue_rows, other_rows]).head(5)
+    else:
+        selected_rows = issue_rows.head(5)
 
-### Failure Case 1: Mid-Sentence Ellipsis Continuation (Check_Start Failed)
-- **Episode:** 2 (`00:06.80` to `00:35.00`)
-- **Triggered Check:** `Check_Start` (FAIL: Starts with ellipsis continuation)
-- **Transcript Snippet:**
-  ```text
-  [JULIANA]: "...far too silent..."
-  [GERALD]: "Juliana, you cannot mean to create a scene here before the congregation."
-  [JULIANA]: "A scene? You broke our vows before God and our families!"
-  ```
-- **Why It Fails:** 
-  The clip begins midway through Juliana's thought (*"...far too silent..."*). In short-form video ads (TikTok/Reels), users decide within 400ms whether to swipe. A fragmented sentence signals bad editing and disorients cold viewers, cutting initial retention by over 40%.
-- **System Correction:** The deterministic boundary snapper rejects any start line beginning with `"..."` or lowercase text, automatically advancing to the first clean grammatical dialogue sentence.
+    doc_lines = [
+        "# ⚠️ Concrete Failure Cases & Anti-Patterns (FAILURES.md)",
+        "",
+        "This document is automatically generated from the latest pipeline run. It catalogs up to 5 candidate picks that triggered deterministic rule check warnings or scored lowest in ranking.",
+        "All transcripts are extracted **verbatim** from the master screenplay lines by Line_ID.",
+        "",
+        "---",
+        ""
+    ]
 
----
+    master_indexed = master_df.set_index("Line_ID")
 
-### Failure Case 2: Silent Atmospheric Establishing Shot (Check_Hook Failed)
-- **Episode:** 1 (`00:00.00` to `00:25.00`)
-- **Triggered Check:** `Check_Hook` (FAIL: No spoken line or action within first 3.0s)
-- **Transcript Snippet:**
-  ```text
-  [CAMERA]: Symmetrical framing on the heavy church doors as they slowly part, pushing in slightly...
-  [ACTION]: Juliana pauses at the threshold, her expression bright with joyful anticipation...
-  [CAMERA]: High wide tracking shot following behind Juliana as she steps into the grand cathedral nave...
-  ```
-- **Why It Fails:** 
-  For the first 6.8 seconds, there is zero dialogue or high-stakes action—only ambient architecture and slow pacing. Television dramas use slow reveals; vertical microdramas die without immediate tension in seconds 0-3.
-- **System Correction:** `Check_Hook` mandates that a spoken character line or high-impact dramatic action occurs within 3.0 seconds of `Start_Time`.
+    for case_num, (_, cand) in enumerate(selected_rows.iterrows(), 1):
+        ep = int(cand.get("Episode", 1))
+        s_id = str(cand.get("Start_Line_ID", "")).strip()
+        e_id = str(cand.get("End_Line_ID", "")).strip()
+        dur = cand.get("Duration_Sec", 0.0)
+        source = cand.get("Source", "UNKNOWN")
+        c_hook = cand.get("Check_Hook", "N/A")
+        c_start = cand.get("Check_Start", "N/A")
+        c_end = cand.get("Check_End", "N/A")
+        c_ctx = cand.get("Check_Context", "N/A")
+        c_viewer = cand.get("Cold_Viewer_Pass", "N/A")
+        c_reason = cand.get("Cold_Viewer_Reason", "N/A")
 
----
+        # Slice master lines between Start_Line_ID and End_Line_ID
+        ep_master = master_df[master_df["Episode"] == ep].reset_index(drop=True)
+        start_matches = ep_master[ep_master["Line_ID"] == s_id].index
+        end_matches = ep_master[ep_master["Line_ID"] == e_id].index
 
-### Failure Case 3: Resolution & Exit Walk-Off (Check_End Failed)
-- **Episode:** 4 (`02:15.00` to `02:35.00`)
-- **Triggered Check:** `Check_End` (FAIL: Ends on resolution/exit action)
-- **Transcript Snippet:**
-  ```text
-  [ALEXANDER]: "The contract is signed. She is my wife now."
-  [FATHER]: "You will regret this, Duke."
-  [ACTION]: Alexander turns in his wheelchair and rolls out of the room, the heavy oak doors closing behind him as the scene fades out.
-  ```
-- **Why It Fails:** 
-  Ending on the character leaving the room and the doors closing provides narrative resolution. The viewer feels closure rather than urgency to install the app or unlock Episode 5.
-- **System Correction:** `Check_End` detects resolution actions (walking away, leaving the room, door closing, fading out) and penalizes or adjusts the cut point to slice before the tension dissipates.
+        if len(start_matches) > 0 and len(end_matches) > 0:
+            i_start = start_matches[0]
+            i_end = end_matches[-1]
+            clip_lines = ep_master.loc[i_start:i_end]
+        else:
+            # Timestamp fallback
+            clip_lines = ep_master[
+                (ep_master["Start_Sec"] >= float(cand.get("Start_Sec", 0.0)) - 0.05) &
+                (ep_master["End_Sec"] <= float(cand.get("End_Sec", 0.0)) + 0.05)
+            ]
 
----
+        # ASSERTION: Every quoted line must exist verbatim in the source master dataframe
+        verbatim_transcript_lines = []
+        for _, q_row in clip_lines.iterrows():
+            q_lid = q_row["Line_ID"]
+            q_content = str(q_row["Content"])
+            assert q_lid in master_indexed.index, f"Line_ID {q_lid} does not exist in master script!"
+            assert q_content in set(master_df["Content"]), f"Content for {q_lid} does not exist in source script!"
+            verbatim_transcript_lines.append(f"[{q_lid}] {q_row['Entity_Type']}: {q_content}")
 
-### Failure Case 4: Unanchored Dialogue Without Speaker Introduction (Check_Context Failed)
-- **Episode:** 5 (`00:10.00` to `00:35.00`)
-- **Triggered Check:** `Check_Context` (needs_context: CLARISSA not introduced in clip)
-- **Transcript Snippet:**
-  ```text
-  [CLARISSA]: "Did you hear what happened in the drawing room?"
-  [MAID]: "Yes, my lady. They say the Duke himself intervened."
-  [CLARISSA]: "She will pay for humiliating Gerald."
-  ```
-- **Why It Fails:** 
-  A cold viewer has no idea who "Clarissa" is, who "Gerald" is, or why they are plotting. Microdrama ads require instant emotional legibility: either the dialogue explicitly names relationships ("As your sister...", "Father!"), or archetype titles clarify roles immediately.
-- **System Correction:** The "Cold Viewer" LLM pass and `Check_Context` flag clips lacking self-contained relationship markers, deprioritizing them during cross-episode ranking.
+        verbatim_snippet = "\n".join(verbatim_transcript_lines[:8])
+        if len(verbatim_transcript_lines) > 8:
+            verbatim_snippet += f"\n... [{len(verbatim_transcript_lines) - 8} additional lines omitted] ..."
 
----
+        doc_lines.extend([
+            f"### Case {case_num}: Episode {ep} (`{cand.get('Start_Time')}` to `{cand.get('End_Time')}`, Duration: `{dur:.1f}s`)",
+            f"- **Candidate Source:** `{source}`",
+            f"- **Triggered Checks:**",
+            f"  - `Check_Hook`: `{c_hook}`",
+            f"  - `Check_Start`: `{c_start}`",
+            f"  - `Check_End`: `{c_end}`",
+            f"  - `Check_Context`: `{c_ctx}`",
+            f"- **Cold Viewer Audit:** `{c_viewer}` ({c_reason})",
+            f"- **Verbatim Transcript Snippet (Verified from Source):**",
+            "  ```text",
+            verbatim_snippet,
+            "  ```",
+            f"- **Why It Fails / Deficiencies:**",
+        ])
 
-### Failure Case 5: Prolonged Duration Exceeding Ad Placement Limits
-- **Episode:** 3 (`01:00.00` to `02:15.00` -> 75.0s)
-- **Triggered Check:** `Duration Validation` (Violates strict 20-60s limit)
-- **Transcript Snippet:**
-  ```text
-  [Duration: 75.0s across 3 full scene transitions]
-  ```
-- **Why It Fails:** 
-  Clips over 60 seconds fail Meta and TikTok Spark Ad placement guidelines for short-form video formats, experiencing steep drops in complete watch-through rate.
-- **System Correction:** Line-ID anchoring recalculates exact millisecond durations directly from line item timestamps in code, instantly triggering automated retries if a candidate exceeds 60.0s.
-"""
+        reasons = []
+        if "FAIL" in str(c_hook) or "WEAK" in str(c_hook):
+            reasons.append(f"Hook flaw: {c_hook}")
+        if "FAIL" in str(c_start):
+            reasons.append(f"Start boundary flaw: {c_start}")
+        if "FAIL" in str(c_end):
+            reasons.append(f"Ending resolution flaw: {c_end}")
+        if "needs_context" in str(c_ctx):
+            reasons.append(f"Context flaw: {c_ctx}")
+        if c_viewer == "FAIL":
+            reasons.append(f"Cold viewer fail: {c_reason}")
+        if not reasons:
+            reasons.append("Low overall rank score due to unranked heuristic generation without LLM evaluation.")
+
+        for r in reasons:
+            doc_lines.append(f"  - {r}")
+
+        doc_lines.extend(["", "---", ""])
+
+    failures_content = "\n".join(doc_lines)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(failures_content)
 
@@ -207,18 +282,18 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate promo extraction quality against hand-labeled benchmark.")
     parser.add_argument("--promos_csv", type=str, default=None, help="Path to promos.csv or manifest CSV")
     parser.add_argument("--labels_csv", type=str, default=os.path.join("eval", "labels.csv"), help="Path to hand-labeled eval CSV")
+    parser.add_argument("--master_csv", type=str, default="output/master_parsed_screenplays.csv", help="Master parsed CSV")
     parser.add_argument("--output_failures_md", type=str, default="FAILURES.md", help="Path to write FAILURES.md")
     args = parser.parse_args()
 
     promos_path = args.promos_csv or find_latest_promos_csv()
     if not promos_path or not os.path.exists(promos_path):
         print(f"No promotional candidates CSV found at {promos_path}. Run the pipeline first.")
-        # Still generate FAILURES.md
-        generate_failures_markdown(args.output_failures_md)
         return
 
     promos_df = pd.read_csv(promos_path)
     labels_df = pd.read_csv(args.labels_csv) if os.path.exists(args.labels_csv) else pd.DataFrame()
+    master_df = load_master_screenplay_df(args.master_csv)
 
     print("=" * 65)
     print("PROMOTIONAL EXTRACTION QUALITY EVALUATION")
@@ -228,9 +303,9 @@ def main():
     print("-" * 65)
 
     prec_results = evaluate_precision_at_n(promos_df, labels_df, top_n_list=[1, 3, 5])
-    print("Precision @ N Metrics:")
+    print("Precision @ N Metrics (Strict Overlap with User Labels, IoU >= 0.35):")
     for k, v in prec_results.items():
-        print(f"  -> {k}: {v:.1f}%")
+        print(f"  -> {k}: {v}")
 
     print("-" * 65)
     det_results = evaluate_deterministic_checks(promos_df)
@@ -238,10 +313,10 @@ def main():
     for k, v in det_results.items():
         print(f"  -> {k}: {v}")
 
-    # Generate FAILURES.md
-    generate_failures_markdown(args.output_failures_md)
+    # Generate FAILURES.md dynamically from latest promos and master lines
+    generate_failures_markdown(promos_df, master_df, args.output_failures_md)
     print("-" * 65)
-    print(f"[SUCCESS] Generated quality evidence documentation: {args.output_failures_md}")
+    print(f"[SUCCESS] Generated verified FAILURES.md -> {args.output_failures_md}")
     print("=" * 65)
 
 
