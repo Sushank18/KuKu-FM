@@ -20,3 +20,5 @@ output/candidate_promo_clips_20_60s.csv
 output/**/subtitles/
 output/run_*/
 output/promo_campaign/
+output/*.zip
+*.zip
