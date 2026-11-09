@@ -249,9 +249,9 @@ tab_dashboard, tab_run = st.tabs(["📊 Promotional Dashboard & Results", "🚀 
 with tab_dashboard:
     if loaded_df is None or loaded_df.empty:
         st.info(
-            "👋 **No promotional manifest loaded.**\n\n"
-            "Run the pipeline on a new screenplay in the **'🚀 Run on a New Screenplay'** tab, "
-            "or execute `python run_pipeline.py` in your terminal."
+            "👋 **No promotional manifest currently loaded on this instance.**\n\n"
+            "- **To view existing results:** Upload your `promos.csv` or `promos.json` file via **'📁 Data Source & Filters > Upload Manifest'** in the left sidebar.\n"
+            "- **To extract fresh promos:** Switch to the **'🚀 Run on a New Screenplay'** tab above to ingest screenplay scripts and extract ranked clips on the fly."
         )
     else:
         # Apply filtering
@@ -517,46 +517,46 @@ with tab_run:
             st.markdown("---")
             st.subheader("📋 Extraction Results & Campaign Manifest")
 
-        top_clip = res_df.iloc[0]
-        st.markdown('<div class="recommendation-box">', unsafe_allow_html=True)
-        st.subheader(f"🏆 #1 Top Ranked Promo: Episode {top_clip['Episode']}")
-        c_meta, c_info = st.columns([1, 2])
-        with c_meta:
-            st.markdown(f"**Exact Timeframe:** `{top_clip['Start_Time']}` $\\rightarrow$ `{top_clip['End_Time']}`")
-            st.markdown(f"**Duration:** `{top_clip['Duration_Sec']:.1f}s`")
-            score_val = top_clip.get('Rank_Score')
-            score_text = f"{score_val:.1f} / 100" if (pd.notna(score_val) and isinstance(score_val, (int, float))) else "Unranked (Offline Heuristic)"
-            st.markdown(f"**Rank Score:** :green[**{score_text}**]")
-            if top_clip.get("On_Screen_Hook_1"):
-                st.markdown(f"**On-Screen Hook:**\n> *\"{top_clip['On_Screen_Hook_1']}\"*")
-        with c_info:
-            st.markdown(f"**🪝 Opening Hook:** {top_clip.get('Hook_Description')}")
-            st.markdown(f"**⚡ Cliffhanger Ending:** {top_clip.get('Cliffhanger_Description')}")
-            st.info(f"💡 **Why Post This First:** {top_clip.get('Why_Post_First', top_clip.get('Justification'))}")
-        st.markdown('</div>', unsafe_allow_html=True)
+            top_clip = res_df.iloc[0]
+            st.markdown('<div class="recommendation-box">', unsafe_allow_html=True)
+            st.subheader(f"🏆 #1 Top Ranked Promo: Episode {top_clip['Episode']}")
+            c_meta, c_info = st.columns([1, 2])
+            with c_meta:
+                st.markdown(f"**Exact Timeframe:** `{top_clip['Start_Time']}` $\\rightarrow$ `{top_clip['End_Time']}`")
+                st.markdown(f"**Duration:** `{top_clip['Duration_Sec']:.1f}s`")
+                score_val = top_clip.get('Rank_Score')
+                score_text = f"{score_val:.1f} / 100" if (pd.notna(score_val) and isinstance(score_val, (int, float))) else "Unranked (Offline Heuristic)"
+                st.markdown(f"**Rank Score:** :green[**{score_text}**]")
+                if top_clip.get("On_Screen_Hook_1"):
+                    st.markdown(f"**On-Screen Hook:**\n> *\"{top_clip['On_Screen_Hook_1']}\"*")
+            with c_info:
+                st.markdown(f"**🪝 Opening Hook:** {top_clip.get('Hook_Description')}")
+                st.markdown(f"**⚡ Cliffhanger Ending:** {top_clip.get('Cliffhanger_Description')}")
+                st.info(f"💡 **Why Post This First:** {top_clip.get('Why_Post_First', top_clip.get('Justification'))}")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-        render_promo_table(res_df)
+            render_promo_table(res_df)
 
-        st.markdown("#### 📥 Export Formatted Campaign Manifest")
-        d_col1, d_col2 = st.columns(2)
-        with d_col1:
-            csv_buf = io.StringIO()
-            res_df.to_csv(csv_buf, index=False)
-            st.download_button(
-                "📥 Download Manifest (.CSV)",
-                data=csv_buf.getvalue().encode("utf-8"),
-                file_name="kuku_promos_manifest.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        with d_col2:
-            json_str = res_df.to_json(orient="records", indent=2)
-            st.download_button(
-                "📥 Download Manifest (.JSON)",
-                data=json_str.encode("utf-8"),
-                file_name="kuku_promos_manifest.json",
-                mime="application/json",
-                use_container_width=True
-            )
+            st.markdown("#### 📥 Export Formatted Campaign Manifest")
+            d_col1, d_col2 = st.columns(2)
+            with d_col1:
+                csv_buf = io.StringIO()
+                res_df.to_csv(csv_buf, index=False)
+                st.download_button(
+                    "📥 Download Manifest (.CSV)",
+                    data=csv_buf.getvalue().encode("utf-8"),
+                    file_name="kuku_promos_manifest.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            with d_col2:
+                json_str = res_df.to_json(orient="records", indent=2)
+                st.download_button(
+                    "📥 Download Manifest (.JSON)",
+                    data=json_str.encode("utf-8"),
+                    file_name="kuku_promos_manifest.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
         else:
             st.warning("⚠️ No candidate clips matched the strict 20.0s–60.0s duration window for the provided script.")
