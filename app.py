@@ -98,6 +98,7 @@ def find_latest_manifest() -> Optional[str]:
         return run_manifests[0]
 
     campaign_csvs = [
+        os.path.join("output", "default_manifest.csv"),
         os.path.join("output", "promo_campaign", "promo_campaign_manifest.csv"),
     ]
     for p in campaign_csvs:
